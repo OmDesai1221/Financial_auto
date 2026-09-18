@@ -56,6 +56,18 @@ FISCAL_YEAR_START_MONTH = 4  # April
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Z]{1,3})(\$?)(\d{1,4})')
 DIFF_WITH_TAIL_RE = re.compile(r'^=G(\d+)-I\1(.+)$')
+TRAILING_MULT_RE = re.compile(r'([*])(\d{1,2})(\s*)$')
+
+
+def fiscal_month_number(d):
+    """1 for April, 2 for May, ... 12 for March."""
+    return (d.month - FISCAL_YEAR_START_MONTH) % 12 + 1
+
+
+def _prev_month(d):
+    if d.month == 1:
+        return datetime.date(d.year - 1, 12, 1)
+    return datetime.date(d.year, d.month - 1, 1)
 
 
 class NotANewMonthError(Exception):
@@ -253,6 +265,40 @@ def classify_movement_formula(formula, row):
     return "template", formula  # subtotal / cross-reference — copy verbatim
 
 
+def classify_amount_formula(formula, prev_month, new_month):
+    """Classifies a non-GL-sourced *amount* cell's old formula/value so we
+    never silently repeat a stale one-off number as if it were live data:
+      - ends in a fiscal-YTD "*N" multiplier matching last month's elapsed
+        count (e.g. Audit Fees' "=600000/12*4") -> bump N for the new month.
+      - contains a cell reference at all (a subtotal SUM, the Opening/
+        Closing-stock rollforward's "-H31" style cross-reference, etc.) ->
+        it's structural, copy it forward verbatim.
+      - a formula with no cell references and no recognized multiplier
+        pattern is pure one-off arithmetic typed for whichever month it was
+        first entered (e.g. "=10786172+1492831") -> leave blank rather than
+        repeat a number that has no reason to still be right.
+      - a plain hardcoded number, same story -> leave blank.
+    Returns (kind, value_or_formula_to_use).
+    """
+    if formula is None:
+        return "blank", None
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return "left-blank", None  # plain hardcoded number — don't repeat it
+
+    m = TRAILING_MULT_RE.search(formula)
+    if m:
+        old_mult = int(m.group(2))
+        if old_mult == fiscal_month_number(prev_month):
+            new_mult = fiscal_month_number(new_month)
+            new_formula = formula[:m.start(2)] + str(new_mult) + formula[m.end(2):]
+            return "fiscal-accrual", new_formula
+
+    if CELL_REF_RE.search(formula):
+        return "template", formula
+
+    return "left-blank", None
+
+
 def process_fifo_sch(ws, totals, new_month, is_new_year_start):
     real_cols = get_real_month_columns(ws, SCH_DATE_ROW, SCH_ANCHOR_COL)
     max_row = ws.max_row
@@ -274,15 +320,18 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
     manual_rows = []
     gl_rows_manual = []
 
+    prev_month = _prev_month(new_month)
+
     def apply_manual_amount(r, desc):
         old_amount_off = 1 if 1 in captured[r] else 0
         old_amount = captured[r][old_amount_off]["value"]
-        if isinstance(old_amount, str) and old_amount.startswith("="):
-            ws.cell(row=r, column=amount_col).value = _retarget_column(
-                old_amount, SCH_ANCHOR_COL + old_amount_off, amount_col)
+        kind, new_value = classify_amount_formula(old_amount, prev_month, new_month)
+        if kind in ("template", "fiscal-accrual"):
+            formula = _retarget_column(new_value, SCH_ANCHOR_COL + old_amount_off, amount_col)
+            ws.cell(row=r, column=amount_col).value = formula
             if desc:
-                manual_rows.append((r, desc, "template"))
-        elif old_amount is not None:
+                manual_rows.append((r, desc, kind))
+        else:
             ws.cell(row=r, column=amount_col).value = None
             if desc:
                 manual_rows.append((r, desc, "left-blank"))
@@ -328,6 +377,7 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
     real_cols = get_real_month_columns(ws, PNL_HEADER_ROW, PNL_ANCHOR_COL)
     max_row = ws.max_row
     insert_count = 1 if is_new_year_start else 2
+    prev_month = _prev_month(new_month)
 
     # the '% of Net Sales' ratio block sits only one column past the main
     # block's last real column, so it MUST be shifted out of the way first
@@ -403,11 +453,12 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
             if not codes:
                 old_amount_off = 1 if 1 in captured[r] else 0
                 old_amount = captured[r][old_amount_off]["value"]
-                if isinstance(old_amount, str) and old_amount.startswith("="):
+                kind, new_value = classify_amount_formula(old_amount, prev_month, new_month)
+                if kind in ("template", "fiscal-accrual"):
                     ws.cell(row=r, column=amount_col).value = _retarget_column(
-                        old_amount, PNL_ANCHOR_COL + old_amount_off, amount_col)
-                elif old_amount is not None:
-                    ws.cell(row=r, column=amount_col).value = old_amount
+                        new_value, PNL_ANCHOR_COL + old_amount_off, amount_col)
+                else:
+                    ws.cell(row=r, column=amount_col).value = None
 
         if movement_col is not None:
             old_mvt = captured[r].get(0, {}).get("value")
