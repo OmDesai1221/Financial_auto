@@ -211,8 +211,18 @@
 </head>
 <body>
   <div class="wrap">
-    <div class="eyebrow">Astra Chemtech</div>
-    <h1>Monthly Update</h1>
+    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+      <div>
+        <div class="eyebrow">Astra Chemtech</div>
+        <h1>Monthly Update</h1>
+      </div>
+      <div style="display:flex; gap:10px; margin-top:4px;">
+        <a href="/change-password" style="font-size:12.5px; color:var(--muted); text-decoration:none; font-weight:600;">Change password</a>
+        <form action="/logout" method="post" style="display:inline;">
+          <button type="submit" style="background:none; border:none; color:var(--muted); font-size:12.5px; font-weight:600; cursor:pointer; padding:0; font-family:inherit;">Log out</button>
+        </form>
+      </div>
+    </div>
     <div class="status-grid">
       <div class="status-pill">PNL: <strong>{{ pnl_month or "no data yet" }}</strong></div>
       <div class="status-pill">ACPLACT: <strong>{{ acplact_month or "no data yet" }}</strong></div>

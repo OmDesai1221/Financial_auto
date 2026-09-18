@@ -3,13 +3,14 @@ import re
 import shutil
 import datetime
 import traceback
-from flask import Flask, request, render_template, send_file, redirect, url_for, flash
+from flask import Flask, request, render_template, send_file, redirect, url_for, flash, session
 
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 
 import transform_type1 as t1
 import transform_type2 as t2
+import auth
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
@@ -27,7 +28,65 @@ for d in (UPLOAD_DIR, OUTPUT_DIR, HISTORY_DIR, PENDING_DIR):
     os.makedirs(d, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = "astra-chemtech-pnl-tool"  # local tool only, no auth needed
+app.secret_key = "astra-chemtech-pnl-tool"  # signs the login session cookie; kept stable across restarts on purpose
+
+PUBLIC_ROUTES = {"login"}  # accessible without being logged in
+
+
+@app.before_request
+def require_login():
+    if request.endpoint is None:
+        return  # e.g. a 404 on a non-matching path — let it 404 normally
+    if request.endpoint in PUBLIC_ROUTES or request.endpoint == "static":
+        return
+    if not session.get("logged_in"):
+        return redirect(url_for("login", next=request.path))
+
+
+def _safe_next_path(candidate):
+    """Only ever redirect to a path within this app — a `next` value from
+    a query string or form field is user-controlled, so an unrestricted
+    redirect there would be an open-redirect vector."""
+    if candidate and candidate.startswith("/") and not candidate.startswith("//"):
+        return candidate
+    return url_for("index")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+        if auth.verify_login(username, password):
+            session["logged_in"] = True
+            session["username"] = username
+            return redirect(_safe_next_path(request.form.get("next")))
+        flash("Incorrect username or password.", "error")
+    next_path = request.args.get("next", "")
+    return render_template("login.html", next_path=next_path)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/change-password", methods=["GET", "POST"])
+def change_password():
+    if request.method == "POST":
+        old_password = request.form.get("old_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        if new_password != confirm_password:
+            flash("New password and confirmation don't match.", "error")
+        else:
+            ok, error = auth.change_password(old_password, new_password)
+            if ok:
+                flash("Password changed.", "ok")
+                return redirect(url_for("index"))
+            flash(error, "error")
+    return render_template("change_password.html")
 
 TRANSFORMATIONS = {
     "pnl": {

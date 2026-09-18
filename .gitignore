@@ -11,6 +11,10 @@ app/outputs/
 app/history/
 app/pending/
 
+# Login credential (starts as the hardcoded default, but changes are saved
+# here per-machine — never something to commit or share)
+app/auth_data.json
+
 # Python
 __pycache__/
 *.pyc

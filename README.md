@@ -69,7 +69,12 @@ cd app
 python3 app.py
 ```
 
-Open **http://localhost:5050** in a browser.
+Open **http://localhost:5050** in a browser. You'll be asked to sign in first:
+
+- **Username:** `kishor`
+- **Password:** `Shree@1977` (default — changeable from within the app via "Change password", which requires the current password to confirm)
+
+The password is stored locally (hashed) in `app/auth_data.json`, gitignored — a changed password persists across restarts but is specific to whichever machine it was changed on.
 
 - Check the boxes for whichever transformation(s) you want to run.
 - Choose **New month** (adds a new column) or **Replace latest month**
