@@ -50,6 +50,7 @@
     .tag.ok { background: #eaf3ee; color: #245a3f; }
     .tag.warn { background: #fdf3e0; color: #8a5a10; }
     .list-line { font-size: 12.5px; color: var(--ink); padding: 3px 0; }
+    .empty-marker { color: #c0392b; font-weight: 700; }
     .actions {
       position: sticky; bottom: 0; background: var(--bg); padding: 16px 0 0; margin-top: 20px;
       display: flex; gap: 10px;
@@ -109,7 +110,7 @@
                 <tr>
                   <td>{{ r.row }}</td>
                   <td>{{ r.code }}</td>
-                  <td class="desc">{{ r.desc }}</td>
+                  <td class="desc">{{ r.desc }}{% if r.value == "" %} <span class="empty-marker" title="No data here yet">*</span>{% endif %}</td>
                   <td>
                     <input class="cell-input" type="text" name="cell_{{ s.key }}_{{ r.row }}"
                            value="{{ r.value }}" data-original="{{ r.value }}">
@@ -121,7 +122,7 @@
             </table>
           </div>
         {% else %}
-          <p class="hint">Most of this transformation's rows aren't individually editable — they're either matched live from Sheet1 or purely calculated. The rows below are the only ones with no Sheet1 source at all, so they're open for you to type in directly.</p>
+          <p class="hint">Most of this transformation's rows aren't individually editable — they're either matched live from Sheet1 or purely calculated. The rows below are the only ones with no Sheet1 source at all, so they're open for you to type in directly. A <span class="empty-marker">*</span> next to a description means there's no data there yet — add one.</p>
 
           {% if s.editable_rows %}
           <div class="scroll-table" style="max-height:none;">
@@ -141,7 +142,7 @@
                   <td>{{ r.row }}</td>
                   <td>{{ 'FIFO-sch' if r.sheet == 'sch' else 'FIFO-PNL' }}</td>
                   <td>{{ r.code }}</td>
-                  <td class="desc">{{ r.desc }}</td>
+                  <td class="desc">{{ r.desc }}{% if r.value == "" %} <span class="empty-marker" title="No data here yet">*</span>{% endif %}</td>
                   <td>
                     <input class="cell-input" type="text" name="cell_acplact_{{ r.sheet }}_{{ r.row }}"
                            value="{{ r.value }}" data-original="{{ r.value }}">

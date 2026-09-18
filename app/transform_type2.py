@@ -47,7 +47,6 @@ PNL_DESC_COL = 3       # C
 PNL_ANCHOR_COL = 5     # E (movement); amount is anchor + 1 (F)
 PNL_HEADER_ROW = 4
 PNL_FIRST_DATA_ROW = 6
-PNL_RATIO_OFFSET = 8   # ratio-of-net-sales block mirrors each main column, +8
 PNL_RATIO_DATE_ROW = 5
 PNL_GROSS_SALES_ROW = 6   # from Sheet1's "Gross sales" label row directly
 PNL_NET_SALES_ROW = 8    # pulled live from FIFO-sch's Net Sales total
@@ -379,28 +378,72 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
     insert_count = 1 if is_new_year_start else 2
     prev_month = _prev_month(new_month)
 
-    # the '% of Net Sales' ratio block sits only one column past the main
-    # block's last real column, so it MUST be shifted out of the way first
-    # — shifting the main block first would make its rightward expansion
-    # collide with (and overwrite) the ratio block's own starting column
-    ratio_anchor = PNL_ANCHOR_COL + PNL_RATIO_OFFSET
-    real_ratio_cols = get_real_month_columns(ws, PNL_RATIO_DATE_ROW, ratio_anchor)
+    # The main block and the '% of Net Sales' ratio block (one spacer
+    # column apart) both grow by `insert_count` every month, but the ratio
+    # block's total displacement is 2x that: once because the main block's
+    # own growth pushes everything after it over, and again for the ratio
+    # block's own new-month insertion. Treating both as a plain
+    # `insert_count` shift (as an earlier version of this code did) made
+    # the main block's growth land exactly on the ratio block's freshly
+    # vacated column, silently overwriting it — this is computed fresh
+    # every run (never a fixed offset) so it keeps working as both blocks
+    # keep growing month after month.
     last_main_col_before_shift = max(real_cols) if real_cols else PNL_ANCHOR_COL - 1
-    shift_columns_and_style(ws, ratio_anchor, insert_count, max_row, real_ratio_cols)
+    ratio_anchor = last_main_col_before_shift + 2  # current ratio block position
+    real_ratio_cols = get_real_month_columns(ws, PNL_RATIO_DATE_ROW, ratio_anchor)
+    total_ratio_shift = insert_count * 2
 
-    captured = shift_columns_and_style(ws, PNL_ANCHOR_COL, insert_count, max_row, real_cols)
+    # Snapshot the ratio block's OLD content BEFORE step 1 touches anything —
+    # step 1's own destination range reaches into the ratio block's current
+    # front column(s) (that's the whole point: the main block's growth
+    # pushes the ratio block over), so reading it after step 1 would already
+    # see step 1's overwrite instead of the original ratio data.
+    ratio_snapshot = {}
+    if real_ratio_cols:
+        last_ratio_col = max(real_ratio_cols)
+        for r in range(1, max_row + 1):
+            for c in range(ratio_anchor, last_ratio_col + 1):
+                cell = ws.cell(row=r, column=c)
+                val = cell.value
+                if isinstance(val, str) and val.startswith('='):
+                    val = remap_formula_columns(val, ratio_anchor, total_ratio_shift)
+                ratio_snapshot[(r, c)] = {"value": val, "style": copy.copy(cell._style)}
 
-    # the ratio block's cells reference the main block's columns directly
-    # (e.g. "=+F10/F$8%"); neither shift above touches that reference since
-    # each only rewrites cells physically inside its own column range — fix
-    # it up now that both blocks have landed in their final positions
-    last_ratio_col_after_shift = (max(real_ratio_cols) + insert_count) if real_ratio_cols else ratio_anchor - 1
-    for r in range(1, max_row + 1):
-        for c in range(ratio_anchor, last_ratio_col_after_shift + 1):
-            cell = ws.cell(row=r, column=c)
-            if isinstance(cell.value, str) and cell.value.startswith('='):
-                cell.value = remap_formula_columns_bounded(
-                    cell.value, PNL_ANCHOR_COL, last_main_col_before_shift, insert_count)
+    # Step 1: shift the main block AND its one spacer column by insert_count.
+    main_and_spacer_cols = list(real_cols) + ([last_main_col_before_shift + 1] if real_ratio_cols else [])
+    captured = shift_columns_and_style(ws, PNL_ANCHOR_COL, insert_count, max_row, main_and_spacer_cols)
+
+    # Step 2: relocate the ratio block's OLD content by 2x insert_count
+    # (its own displacement, doubled), while creating fresh blank columns
+    # only at its new front — NOT at [ratio_anchor, ratio_anchor+insert_count)
+    # which step 1 already correctly filled with the main block's own
+    # (shifted) rightmost column and spacer.
+    if real_ratio_cols:
+        for r in range(1, max_row + 1):
+            for c in range(ratio_anchor, last_ratio_col + 1):
+                data = ratio_snapshot[(r, c)]
+                dest = ws.cell(row=r, column=c + total_ratio_shift)
+                dest.value = data["value"]
+                dest._style = copy.copy(data["style"])
+
+        new_ratio_front = ratio_anchor + insert_count
+        for r in range(1, max_row + 1):
+            for off in range(insert_count):
+                new_cell = ws.cell(row=r, column=new_ratio_front + off)
+                new_cell.value = None
+                style_source = ws.cell(row=r, column=new_ratio_front + insert_count + off)
+                new_cell._style = copy.copy(style_source._style)
+
+        # the ratio block's cells also reference the main block's columns
+        # directly (e.g. "=+F10/F$8%"), which needs the main block's own
+        # (smaller) shift amount applied, not the ratio block's doubled one
+        last_ratio_col_after_shift = last_ratio_col + total_ratio_shift
+        for r in range(1, max_row + 1):
+            for c in range(new_ratio_front, last_ratio_col_after_shift + 1):
+                cell = ws.cell(row=r, column=c)
+                if isinstance(cell.value, str) and cell.value.startswith('='):
+                    cell.value = remap_formula_columns_bounded(
+                        cell.value, PNL_ANCHOR_COL, last_main_col_before_shift, insert_count)
 
     amount_col = PNL_ANCHOR_COL if is_new_year_start else PNL_ANCHOR_COL + 1
     movement_col = None if is_new_year_start else PNL_ANCHOR_COL
@@ -467,21 +510,20 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
             elif old_mvt is not None:
                 ws.cell(row=r, column=movement_col).value = old_mvt
 
-    process_pnl_ratio_block(ws, new_month, is_new_year_start, amount_col, movement_col, max_row)
+    if real_ratio_cols:
+        process_pnl_ratio_block(ws, new_month, is_new_year_start, amount_col, movement_col,
+                                 max_row, new_ratio_front)
 
     return {"gl_rows": gl_rows, "gross_sales_status": gross_sales_status}
 
 
-def process_pnl_ratio_block(ws, new_month, is_new_year_start, main_amount_col, main_movement_col, max_row):
-    """The '% of Net Sales' block mirrors every main column, offset by
-    PNL_RATIO_OFFSET columns to the right, each cell just
-    '=+<mainletter><row>/<mainletter>$8%'. Shift it in lockstep and give
-    the newly-inserted ratio column(s) fresh formulas pointing at the
-    corresponding brand-new main column(s)."""
-    ratio_anchor = PNL_ANCHOR_COL + PNL_RATIO_OFFSET
+def process_pnl_ratio_block(ws, new_month, is_new_year_start, main_amount_col, main_movement_col,
+                             max_row, ratio_anchor):
+    """The '% of Net Sales' block mirrors every main column. Its columns
+    were already shifted/relocated by process_fifo_pnl (which computes
+    where its fresh columns land, since that depends on the main block's
+    current size, not a fixed offset) — this call only populates them."""
     insert_count = 1 if is_new_year_start else 2
-    # (already shifted by process_fifo_pnl, before the main block, to avoid
-    # the two blocks' insertions colliding — this call only populates)
 
     new_month_dt = datetime.datetime(new_month.year, new_month.month, new_month.day)
     new_ratio_amount_col = ratio_anchor + (0 if is_new_year_start else 1)
