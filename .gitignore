@@ -1,0 +1,21 @@
+# Real financial data — never commit these, regardless of repo visibility.
+# The app creates/reads them in the project root and inside app/*.
+*.xlsx
+*.xlsm
+~$*.xlsx
+~$*.xlsm
+
+# Runtime folders the app manages itself (auto-created on first run)
+app/uploads/
+app/outputs/
+app/history/
+app/pending/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store

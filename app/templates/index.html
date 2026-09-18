@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>P&amp;L Monthly Update</title>
+  <style>
+    :root {
+      --ink: #1a1d23;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --accent: #2f6f4e;
+      --accent-dark: #245a3f;
+      --accent-soft: #eaf3ee;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      margin: 0;
+      padding: 56px 20px 80px;
+    }
+    .wrap { max-width: 620px; margin: 0 auto; }
+    .eyebrow {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 6px;
+    }
+    h1 {
+      font-size: 26px;
+      font-weight: 700;
+      margin: 0 0 6px;
+      letter-spacing: -0.01em;
+    }
+    .status {
+      font-size: 14px;
+      color: var(--muted);
+      margin-bottom: 28px;
+    }
+    .status strong { color: var(--ink); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      box-shadow: 0 1px 3px rgba(16, 24, 40, 0.04), 0 1px 2px rgba(16, 24, 40, 0.03);
+    }
+    label.field-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 8px;
+    }
+    select {
+      width: 100%;
+      padding: 11px 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 14px;
+      color: var(--ink);
+      background: #fff;
+      margin-bottom: 6px;
+      appearance: none;
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2'><path d='M6 9l6 6 6-6'/></svg>");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+    }
+    select:disabled { color: #b0b4bb; background-color: #fafafa; }
+    .transform-desc {
+      font-size: 12.5px;
+      color: var(--muted);
+      margin: 0 0 22px;
+      line-height: 1.5;
+    }
+    .dropzone {
+      border: 1.5px dashed var(--border);
+      border-radius: 10px;
+      padding: 22px;
+      text-align: center;
+      margin-bottom: 22px;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .dropzone.has-file { border-color: var(--accent); background: var(--accent-soft); }
+    .dropzone input[type=file] { display: none; }
+    .dropzone .pick {
+      display: inline-block;
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--accent-dark);
+      background: var(--accent-soft);
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    .dropzone .filename {
+      display: block;
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    button.submit {
+      width: 100%;
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 13px 20px;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    button.submit:hover { background: var(--accent-dark); }
+    .flash {
+      padding: 12px 16px;
+      border-radius: 10px;
+      margin-bottom: 20px;
+      font-size: 13.5px;
+    }
+    .flash.error { background: #fde8e8; color: #9b1c1c; }
+    .flash.ok { background: #eaf3ee; color: #245a3f; }
+    .mode-toggle {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .mode-toggle label {
+      flex: 1;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+      cursor: pointer;
+      color: var(--muted);
+      transition: all 0.15s ease;
+    }
+    .mode-toggle input { display: none; }
+    .mode-toggle input:checked + label {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--accent-dark);
+    }
+    .undo-row {
+      margin-top: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    button.undo {
+      background: none;
+      border: 1px solid var(--border);
+      color: #9b1c1c;
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.undo:hover { background: #fde8e8; }
+    .transform-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .transform-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .transform-option input { margin-top: 3px; }
+    .transform-option.checked {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .transform-option .t-label { font-weight: 600; font-size: 13.5px; }
+    .transform-option .t-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .status-grid {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+    }
+    .status-pill {
+      font-size: 13px;
+      color: var(--muted);
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 8px 14px;
+    }
+    .status-pill strong { color: var(--ink); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="eyebrow">Astra Chemtech</div>
+    <h1>Monthly Update</h1>
+    <div class="status-grid">
+      <div class="status-pill">PNL: <strong>{{ pnl_month or "no data yet" }}</strong></div>
+      <div class="status-pill">ACPLACT: <strong>{{ acplact_month or "no data yet" }}</strong></div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, msg in messages %}
+        <div class="flash {{ category }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="card">
+      <form action="/process" method="post" enctype="multipart/form-data" id="uploadForm">
+        <label class="field-label">Transformation(s) to run</label>
+        <div class="transform-list">
+          {% for key, t in transformations.items() %}
+          <label class="transform-option" for="transform_{{ key }}">
+            <input type="checkbox" name="transforms" id="transform_{{ key }}" value="{{ key }}" checked>
+            <div>
+              <div class="t-label">{{ t.label }}</div>
+              <div class="t-desc">{{ t.description }}</div>
+            </div>
+          </label>
+          {% endfor %}
+        </div>
+
+        <label class="field-label">What is this upload?</label>
+        <div class="mode-toggle">
+          {% for key, m in modes.items() %}
+          <input type="radio" name="mode" id="mode_{{ key }}" value="{{ key }}"
+                 data-desc="{{ m.description }}" {% if loop.first %}checked{% endif %}>
+          <label for="mode_{{ key }}">{{ m.label }}</label>
+          {% endfor %}
+        </div>
+        <p class="transform-desc" id="modeDesc"></p>
+
+        <label class="field-label">Sheet1 file</label>
+        <div class="dropzone" id="dropzone">
+          <label class="pick">
+            Choose file
+            <input type="file" name="sheet1_file" id="fileInput" accept=".xlsx" required>
+          </label>
+          <span class="filename" id="filename">No file chosen</span>
+        </div>
+
+        <button class="submit" type="submit">Submit</button>
+      </form>
+
+      <div class="undo-row">
+        <span>{% if can_undo %}You can revert the last change if something looks wrong.{% else %}No previous version available to undo.{% endif %}</span>
+        <form action="/undo" method="post" onsubmit="return confirm('Revert the P&amp;L workbook to its state before the last change?');">
+          <button class="undo" type="submit" {% if not can_undo %}disabled{% endif %}>Undo last change</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    document.querySelectorAll('.transform-option').forEach(opt => {
+      const input = opt.querySelector('input');
+      const sync = () => opt.classList.toggle('checked', input.checked);
+      input.addEventListener('change', sync);
+      sync();
+    });
+
+    const modeInputs = document.querySelectorAll('input[name="mode"]');
+    const modeDesc = document.getElementById('modeDesc');
+    function updateModeDesc() {
+      const checked = document.querySelector('input[name="mode"]:checked');
+      modeDesc.textContent = checked ? checked.dataset.desc : '';
+    }
+    modeInputs.forEach(el => el.addEventListener('change', updateModeDesc));
+    updateModeDesc();
+
+    const fileInput = document.getElementById('fileInput');
+    const filename = document.getElementById('filename');
+    const dropzone = document.getElementById('dropzone');
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length) {
+        filename.textContent = fileInput.files[0].name;
+        dropzone.classList.add('has-file');
+      } else {
+        filename.textContent = 'No file chosen';
+        dropzone.classList.remove('has-file');
+      }
+    });
+  </script>
+</body>
+</html>
