@@ -62,6 +62,7 @@ SOURCE_LABELS = {
     "manual-formula-left-blank": "Left blank — old formula had no safe pattern",
     "no-formula-found": "Left blank — no formula to carry forward",
     "adjustment_dropped": "One-off adjustment dropped — review if one applies this month",
+    "gross-sales-matched": "From Sheet1's Gross Sales row",
 }
 
 
@@ -97,6 +98,11 @@ def copy_sheet_values(src_ws, dest_ws):
             target.value = cell.value
 
 
+NEEDS_ATTENTION_TAGS = {
+    "zeroed", "left-blank", "manual-formula-left-blank", "no-formula-found", "adjustment_dropped",
+}
+
+
 def build_pnl_review_rows(ws, report):
     """One row per GL-linked or manual/subtotal row touched by the merge,
     editable value/formula for the new/latest month's column L."""
@@ -128,6 +134,7 @@ def build_pnl_review_rows(ws, report):
             "desc": desc or "",
             "value": cell_display_value(cell.value),
             "source": SOURCE_LABELS.get(source, source),
+            "needs_attention": source in NEEDS_ATTENTION_TAGS,
         })
     return rows
 
@@ -146,16 +153,24 @@ def build_acplact_editable_rows(wb, report):
     manual_row_nums = {r for r, _code, _desc in report.get("gl_rows_manual", [])}
     left_blank_rows = {r for r, _desc, tag in report.get("manual_rows", []) if tag == "left-blank"}
     editable_sch_rows = manual_row_nums | left_blank_rows
+    suggestions = report.get("suggestions", {})
 
     rows = []
     for r in sorted(editable_sch_rows):
         cell = sch_ws.cell(row=r, column=sch_amount_col)
+        # the cell itself is deliberately left blank (we don't trust the old
+        # formula enough to auto-apply it) — but show it as a starting point
+        # to edit rather than an empty box with no context
+        display_value = cell_display_value(cell.value)
+        if display_value == "" and r in suggestions:
+            display_value = str(suggestions[r])
         rows.append({
             "sheet": "sch",
             "row": r,
             "code": sch_ws.cell(row=r, column=t2.SCH_GL_COL).value or "",
             "desc": sch_ws.cell(row=r, column=t2.SCH_DESC_COL).value or "",
-            "value": cell_display_value(cell.value),
+            "value": display_value,
+            "needs_attention": True,
         })
 
     gross_cell = pnl_ws.cell(row=t2.PNL_GROSS_SALES_ROW, column=pnl_amount_col)
@@ -165,6 +180,7 @@ def build_acplact_editable_rows(wb, report):
         "code": "",
         "desc": pnl_ws.cell(row=t2.PNL_GROSS_SALES_ROW, column=t2.PNL_DESC_COL).value or "Gross Sales",
         "value": cell_display_value(gross_cell.value),
+        "needs_attention": True,
     })
     return rows
 

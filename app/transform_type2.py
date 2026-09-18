@@ -277,12 +277,16 @@ def classify_amount_formula(formula, prev_month, new_month):
         first entered (e.g. "=10786172+1492831") -> leave blank rather than
         repeat a number that has no reason to still be right.
       - a plain hardcoded number, same story -> leave blank.
-    Returns (kind, value_or_formula_to_use).
+    For the "left-blank" case, the old value/formula is still returned as
+    a `suggestion` — not written to the cell (we don't trust it), but
+    worth showing on the review page as a starting point to edit rather
+    than leaving the box empty with no context at all.
+    Returns (kind, value_or_formula_to_use, suggestion_or_None).
     """
     if formula is None:
-        return "blank", None
+        return "blank", None, None
     if not isinstance(formula, str) or not formula.startswith("="):
-        return "left-blank", None  # plain hardcoded number — don't repeat it
+        return "left-blank", None, str(formula)  # plain hardcoded number — don't repeat it, but suggest it
 
     m = TRAILING_MULT_RE.search(formula)
     if m:
@@ -290,12 +294,12 @@ def classify_amount_formula(formula, prev_month, new_month):
         if old_mult == fiscal_month_number(prev_month):
             new_mult = fiscal_month_number(new_month)
             new_formula = formula[:m.start(2)] + str(new_mult) + formula[m.end(2):]
-            return "fiscal-accrual", new_formula
+            return "fiscal-accrual", new_formula, new_formula
 
     if CELL_REF_RE.search(formula):
-        return "template", formula
+        return "template", formula, formula
 
-    return "left-blank", None
+    return "left-blank", None, formula
 
 
 def process_fifo_sch(ws, totals, new_month, is_new_year_start):
@@ -318,13 +322,14 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
     gl_rows_partial = []
     manual_rows = []
     gl_rows_manual = []
+    suggestions = {}
 
     prev_month = _prev_month(new_month)
 
     def apply_manual_amount(r, desc):
         old_amount_off = 1 if 1 in captured[r] else 0
         old_amount = captured[r][old_amount_off]["value"]
-        kind, new_value = classify_amount_formula(old_amount, prev_month, new_month)
+        kind, new_value, suggestion = classify_amount_formula(old_amount, prev_month, new_month)
         if kind in ("template", "fiscal-accrual"):
             formula = _retarget_column(new_value, SCH_ANCHOR_COL + old_amount_off, amount_col)
             ws.cell(row=r, column=amount_col).value = formula
@@ -334,6 +339,8 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
             ws.cell(row=r, column=amount_col).value = None
             if desc:
                 manual_rows.append((r, desc, "left-blank"))
+            if suggestion is not None:
+                suggestions[r] = suggestion
 
     for r in range(SCH_FIRST_DATA_ROW, max_row + 1):
         code_cell = ws.cell(row=r, column=SCH_GL_COL).value
@@ -369,6 +376,7 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
         "gl_rows_manual": gl_rows_manual,
         "manual_rows": manual_rows,
         "amount_col": amount_col,
+        "suggestions": suggestions,
     }
 
 
@@ -496,7 +504,7 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
             if not codes:
                 old_amount_off = 1 if 1 in captured[r] else 0
                 old_amount = captured[r][old_amount_off]["value"]
-                kind, new_value = classify_amount_formula(old_amount, prev_month, new_month)
+                kind, new_value, _suggestion = classify_amount_formula(old_amount, prev_month, new_month)
                 if kind in ("template", "fiscal-accrual"):
                     ws.cell(row=r, column=amount_col).value = _retarget_column(
                         new_value, PNL_ANCHOR_COL + old_amount_off, amount_col)
@@ -599,6 +607,7 @@ def apply_new_month(wb, sheet1_ws):
         "manual_rows": sch_report["manual_rows"],
         "pnl_gl_rows": pnl_report["gl_rows"],
         "gross_sales_status": pnl_report["gross_sales_status"],
+        "suggestions": sch_report["suggestions"],
     }
 
 
@@ -692,4 +701,5 @@ def replace_latest_month(wb, sheet1_ws):
         "pnl_gl_rows": pnl_gl_rows_updated,
         "gl_rows_updated": gl_rows_updated,
         "gross_sales_status": gross_sales_status,
+        "suggestions": {},
     }

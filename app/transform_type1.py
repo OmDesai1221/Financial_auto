@@ -48,6 +48,8 @@ DESC_COL = 3        # column C
 UNIT_COLS = list(range(4, 12))   # D..K
 TOTAL_COL = 12      # column L is always the "current/new" month slot
 
+GROSS_SALES_LABEL_PREFIX = "gross sale"  # matches both "GROSS SALE" (P&L) and "Gross sales" (Sheet1)
+
 
 def parse_month_from_title(title):
     """'Profit & Loss Account as on July-2026' / 'as on July 2026' -> date(2026,7,1)"""
@@ -67,19 +69,25 @@ def fiscal_month_number(d):
 
 
 def read_sheet1(ws):
-    """Returns (month_date, ordered list of dict(code, desc, units[8], total))"""
+    """Returns (month_date, ordered list of dict(code, desc, units[8], total),
+    gross_sales). gross_sales is the Total Balance the client typed into
+    Sheet1's own "Gross sales" label row (which carries no GL code, so it's
+    invisible to the code-keyed rows list otherwise), or None if blank."""
     title = ws.cell(row=4, column=3).value or ws.cell(row=4, column=2).value
     month_date = parse_month_from_title(title)
     rows = []
+    gross_sales = None
     for row in ws.iter_rows(min_row=7, max_row=ws.max_row):
         code = row[GL_COL - 1].value
         desc = row[DESC_COL - 1].value
         if not code:
+            if isinstance(desc, str) and desc.strip().lower().startswith(GROSS_SALES_LABEL_PREFIX):
+                gross_sales = row[TOTAL_COL - 1].value
             continue
         units = [row[c - 1].value for c in UNIT_COLS]
         total = row[TOTAL_COL - 1].value
         rows.append({"code": code, "desc": desc, "units": units, "total": total})
-    return month_date, rows
+    return month_date, rows, gross_sales
 
 
 def _shift_col_letter(letter, shift_from_col, delta=1):
@@ -282,7 +290,7 @@ def _retarget_column(formula, from_col, to_col):
     return CELL_REF_RE.sub(_sub, formula)
 
 
-def classify_and_fill_manual_row(ws, r, new_month_date, old_month_cols):
+def classify_and_fill_manual_row(ws, r, new_month_date, old_month_cols, gross_sales=None):
     """old_month_cols: the *new* column positions of what used to be
     L, M, N, O ... (after the general column shift already ran, so any
     cross-references inside these formulas already point at the right
@@ -292,6 +300,17 @@ def classify_and_fill_manual_row(ws, r, new_month_date, old_month_cols):
     desc = (ws.cell(row=r, column=DESC_COL).value or "").strip()
     old_l_col = old_month_cols[0]
     old_l_val = ws.cell(row=r, column=old_l_col).value
+
+    if desc.lower().startswith(GROSS_SALES_LABEL_PREFIX):
+        # same figure the client types into Sheet1 for ACPLACT's Gross Sales
+        # row — no safe formula ever existed for this row (it was always a
+        # one-off hardcoded number per month), so use the real source now
+        # that one's available, instead of repeating a stale old formula
+        if gross_sales is not None:
+            ws.cell(row=r, column=TOTAL_COL).value = gross_sales
+            return "gross-sales-matched"
+        ws.cell(row=r, column=TOTAL_COL).value = None
+        return "left-blank"
 
     if desc.upper() in SUBTOTAL_DESCRIPTIONS:
         if isinstance(old_l_val, str) and old_l_val.startswith('='):
@@ -348,7 +367,7 @@ def apply_new_month(wb):
     ws = wb["P&L"]
     s1 = wb["Sheet1"]
 
-    new_month_date, sheet1_rows = read_sheet1(s1)
+    new_month_date, sheet1_rows, gross_sales = read_sheet1(s1)
 
     current_month = get_current_pnl_month(ws)
     if current_month is not None and new_month_date <= current_month:
@@ -412,7 +431,7 @@ def apply_new_month(wb):
         desc = ws.cell(row=r, column=DESC_COL).value
         if not desc:
             continue
-        tag = classify_and_fill_manual_row(ws, r, new_month_date, shifted_real_month_cols)
+        tag = classify_and_fill_manual_row(ws, r, new_month_date, shifted_real_month_cols, gross_sales)
         manual_report.append((r, desc, tag))
 
     return {
@@ -442,7 +461,7 @@ def replace_latest_month(wb):
     ws = wb["P&L"]
     s1 = wb["Sheet1"]
 
-    new_month_date, sheet1_rows = read_sheet1(s1)
+    new_month_date, sheet1_rows, _gross_sales = read_sheet1(s1)
 
     current_month = get_current_pnl_month(ws)
     if current_month is None:
