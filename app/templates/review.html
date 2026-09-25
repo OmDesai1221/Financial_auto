@@ -175,6 +175,27 @@
           {% endfor %}
           {% endif %}
 
+          {% if s.report.unmapped_codes %}
+          <div class="tag warn" style="margin-top:10px;">* In Sheet1 but not linked to any row here — these amounts are NOT in the workbook. Type each into the right row (or add its GL code to that row's code cell for next month)</div>
+          {% for code, desc, amt in s.report.unmapped_codes %}
+          <div class="list-line">{{ code }} — {{ desc }} — <strong>{{ "{:,.2f}".format(amt) }}</strong></div>
+          {% endfor %}
+          {% endif %}
+
+          {% if s.report.sign_flipped %}
+          <div class="tag ok" style="margin-top:10px;">Closing stock — sign reversed to match how this sheet keeps it (as a deduction)</div>
+          {% for r, code, desc in s.report.sign_flipped %}
+          <div class="list-line">Row {{ r }} — {{ code }} — {{ desc.strip() }}</div>
+          {% endfor %}
+          {% endif %}
+
+          {% if s.report.opening_carried %}
+          <div class="tag ok" style="margin-top:10px;">Opening stock — carried forward unchanged (fixed for the fiscal year)</div>
+          {% for r, code, desc in s.report.opening_carried %}
+          <div class="list-line">Row {{ r }} — {{ code }} — {{ desc.strip() }}</div>
+          {% endfor %}
+          {% endif %}
+
           {% if s.report.manual_rows %}
           <div class="tag warn" style="margin-top:10px;">Non-GL rows auto-filled or left blank</div>
           {% for r, desc, tag in s.report.manual_rows %}

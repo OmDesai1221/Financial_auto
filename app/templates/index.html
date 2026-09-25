@@ -278,6 +278,18 @@
         </form>
       </div>
     </div>
+
+    {% if recent %}
+    <div class="card" style="margin-top:16px;">
+      <label class="field-label">Download the file from last time</label>
+      {% for f in recent %}
+      <div class="undo-row" style="margin-top:8px;">
+        <span><strong style="color:var(--ink);">{{ f.label }}</strong> — {{ f.filename }}<br>saved {{ f.when }}</span>
+        <a href="/download/{{ f.filename|urlencode }}" style="font-size:12.5px; font-weight:600; color:var(--accent-dark); text-decoration:none; border:1px solid var(--border); padding:7px 14px; border-radius:8px;">Download</a>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
   </div>
 
   <script>

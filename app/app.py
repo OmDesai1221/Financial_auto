@@ -113,7 +113,7 @@ MODES = {
 SOURCE_LABELS = {
     "matched": "From Sheet1 (matched by GL Code)",
     "zeroed": "Set to 0 — not found in this Sheet1",
-    "new_gl": "New GL row inserted from Sheet1",
+    "new_gl": "NEW row inserted — check it belongs here or add its code to an existing row",
     "template": "Auto-filled — subtotal/movement formula",
     "fiscal-accrual": "Auto-filled — fiscal-YTD formula, multiplier bumped",
     "flat-value": "Auto-filled — unchanged from prior months",
@@ -122,6 +122,8 @@ SOURCE_LABELS = {
     "no-formula-found": "Left blank — no formula to carry forward",
     "adjustment_dropped": "One-off adjustment dropped — review if one applies this month",
     "gross-sales-matched": "From Sheet1's Gross Sales row",
+    "adopted": "GL Code attached to your existing row (no duplicate added)",
+    "partial": "Some of this row's GL codes are missing from Sheet1",
 }
 
 
@@ -159,39 +161,48 @@ def copy_sheet_values(src_ws, dest_ws):
 
 NEEDS_ATTENTION_TAGS = {
     "zeroed", "left-blank", "manual-formula-left-blank", "no-formula-found", "adjustment_dropped",
+    "new_gl", "partial",
 }
 
 
 def build_pnl_review_rows(ws, report):
     """One row per GL-linked or manual/subtotal row touched by the merge,
     editable value/formula for the new/latest month's column L."""
-    zeroed_rows = {r for r, _, _ in report.get("gl_rows_zeroed", [])}
-    new_gl_codes = {code for code, _ in report.get("new_gl_rows_inserted", [])}
-    new_gl_rows = {r for r, code, _ in t1.get_existing_gl_rows(ws) if code in new_gl_codes}
+    t1.detect_layout(ws)
+    new_codes = {code for code, _ in report.get("new_gl_rows_inserted", [])}
+    adopted_codes = {code for code, _, _ in report.get("adopted_rows", [])}
+    partial_rows = {r for r, _, _ in report.get("gl_rows_partial", [])}
     manual_tags = {r: tag for r, _, tag in report.get("manual_rows", [])}
+    suggestions = report.get("suggestions", {})
 
     rows = []
     for r in range(1, ws.max_row + 1):
         code = ws.cell(row=r, column=t1.GL_COL).value
         desc = ws.cell(row=r, column=t1.DESC_COL).value
-        if code:
-            if r in zeroed_rows:
-                source = "zeroed"
-            elif r in new_gl_rows:
+        codes = t1.parse_codes(code)
+        if r in manual_tags:
+            source = manual_tags[r]
+        elif code and r > t1.HEADER_ROW:
+            if any(c in new_codes for c in codes):
                 source = "new_gl"
+            elif any(c in adopted_codes for c in codes):
+                source = "adopted"
+            elif r in partial_rows:
+                source = "partial"
             else:
                 source = "matched"
-        elif r in manual_tags:
-            source = manual_tags[r]
         else:
             continue
 
         cell = ws.cell(row=r, column=t1.TOTAL_COL)
+        value = cell_display_value(cell.value)
+        if value == "" and r in suggestions:
+            value = suggestions[r]
         rows.append({
             "row": r,
             "code": code or "",
             "desc": desc or "",
-            "value": cell_display_value(cell.value),
+            "value": value,
             "source": SOURCE_LABELS.get(source, source),
             "needs_attention": source in NEEDS_ATTENTION_TAGS,
         })
@@ -249,8 +260,8 @@ def get_pnl_current_month():
         return None
     try:
         wb = openpyxl.load_workbook(PNL_PATH, data_only=True)
-        d = wb["P&L"].cell(row=7, column=t1.TOTAL_COL).value
-        return d.strftime("%B %Y") if isinstance(d, datetime.datetime) else None
+        d = t1.get_current_pnl_month(wb["P&L"])
+        return d.strftime("%B %Y") if d else None
     except Exception:
         return None
 
@@ -282,6 +293,20 @@ def latest_backup_batch():
     return [os.path.join(HISTORY_DIR, f) for ts, f in with_ts if ts == latest_ts]
 
 
+def recent_outputs():
+    """Newest finished file of each kind, so the client can re-download last
+    time's result on a fresh visit."""
+    found = []
+    for label, prefix in (("PNL", "P&L STATEMENT ("), ("ACPLACT", "acplact (")):
+        files = [f for f in os.listdir(OUTPUT_DIR) if f.startswith(prefix) and f.endswith(".xlsx")]
+        if not files:
+            continue
+        newest = max(files, key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)))
+        when = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(OUTPUT_DIR, newest)))
+        found.append({"label": label, "filename": newest, "when": when.strftime("%d %b %Y, %H:%M")})
+    return found
+
+
 @app.route("/", methods=["GET"])
 def index():
     pnl_month = get_pnl_current_month()
@@ -294,6 +319,7 @@ def index():
         pnl_month=pnl_month,
         acplact_month=acplact_month,
         can_undo=can_undo,
+        recent=recent_outputs(),
     )
 
 
@@ -329,6 +355,8 @@ def process():
             if not os.path.isfile(PNL_PATH):
                 raise FileNotFoundError("No existing P&L STATEMENT.xlsx found in the project folder.")
             pnl_wb = openpyxl.load_workbook(PNL_PATH)  # keep formulas
+            if "Sheet1" not in pnl_wb.sheetnames:
+                pnl_wb.create_sheet("Sheet1")
             copy_sheet_values(uploaded_ws, pnl_wb["Sheet1"])
             run_fn = t1.apply_new_month if mode_key == "new_month" else t1.replace_latest_month
             report = run_fn(pnl_wb)
@@ -394,6 +422,7 @@ def confirm():
     if ran_pnl:
         pnl_wb = openpyxl.load_workbook(PENDING_PNL_PATH)
         ws = pnl_wb["P&L"]
+        t1.detect_layout(ws)
         edited = 0
         for key, text in request.form.items():
             if not key.startswith("cell_pnl_"):
@@ -489,6 +518,7 @@ def undo():
 
 @app.route("/download/<path:filename>")
 def download(filename):
+    filename = os.path.basename(filename)
     path = os.path.join(OUTPUT_DIR, filename)
     if not os.path.isfile(path):
         flash("File not found.", "error")

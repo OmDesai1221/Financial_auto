@@ -122,6 +122,6 @@ app/
 - "Undo" reverts every file changed in the most recent run together (if you
   ran both transformations at once, Undo restores both; if you ran only one,
   it only touches that one).
-- There's no login/auth on this tool — anyone with the tunnel link while
-  it's live can use it. Only share the link directly with the intended user,
-  and don't leave the tunnel running longer than needed.
+- The tool needs a login (see above). Only share the tunnel link with the intended user, and don't leave the tunnel running longer than needed.
+- The first page has a **Download the file from last time** section for re-fetching the most recent finished PNL / ACPLACT files.
+- ACPLACT: opening stock (`X1…` codes) is carried forward unchanged; closing stock (`R3…`) follows the sign used the previous month; Sheet1 codes not linked to any row are listed on the review page with their amounts.

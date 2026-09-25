@@ -55,6 +55,8 @@ FISCAL_YEAR_START_MONTH = 4  # April
 
 CELL_REF_RE = re.compile(r'(\$?)([A-Z]{1,3})(\$?)(\d{1,4})')
 DIFF_WITH_TAIL_RE = re.compile(r'^=G(\d+)-I\1(.+)$')
+NUMERIC_TAIL_RE = re.compile(r'^(=[^0-9]*?-?\+?\$?[A-Z]{1,3}\$?\d{1,4})[+-]\d{4,}(?:\.\d+)?$')
+TITLE_DATE_RE = re.compile(r'(year ended\s+)\d{1,2}\.\d{1,2}\.\d{4}', re.I)
 TRAILING_MULT_RE = re.compile(r'([*])(\d{1,2})(\s*)$')
 
 
@@ -100,7 +102,7 @@ def is_fiscal_year_start(d):
     return d.month == FISCAL_YEAR_START_MONTH
 
 
-GROSS_SALES_LABEL = "gross sales"
+GROSS_SALES_LABEL_PREFIX = "gross sale"   # matches "GROSS SALE" and "GROSS SALES"
 
 
 def read_sheet1_totals(sheet1_ws):
@@ -115,7 +117,7 @@ def read_sheet1_totals(sheet1_ws):
         desc = row[2].value  # column C
         if code:
             totals[code] = row[11].value  # column L
-        elif isinstance(desc, str) and desc.strip().lower() == GROSS_SALES_LABEL:
+        elif isinstance(desc, str) and desc.strip().lower().startswith(GROSS_SALES_LABEL_PREFIX):
             gross_sales = row[11].value
 
     title = sheet1_ws.cell(row=4, column=2).value or sheet1_ws.cell(row=4, column=3).value
@@ -128,6 +130,31 @@ def read_sheet1_totals(sheet1_ws):
     month_num = months.get(m.group(1).lower())
     new_month = datetime.date(int(m.group(2)), month_num, 1)
     return totals, new_month, gross_sales
+
+
+def read_sheet1_descriptions(sheet1_ws):
+    """code -> GL description, for reporting codes nothing maps."""
+    return {row[1].value: row[2].value
+            for row in sheet1_ws.iter_rows(min_row=7, max_row=sheet1_ws.max_row) if row[1].value}
+
+
+def find_unmapped_codes(wb, totals, descriptions):
+    """Sheet1 codes with a non-zero balance that no code cell in FIFO-sch or
+    FIFO - P & L refers to. Their amounts are in Sheet1 but land nowhere in
+    this workbook, so they must be shown to the user rather than dropped."""
+    used = set()
+    sch = wb[FIFO_SCH_SHEET]
+    for r in range(SCH_FIRST_DATA_ROW, sch.max_row + 1):
+        used.update(parse_gl_codes(sch.cell(row=r, column=SCH_GL_COL).value))
+    pnl = wb[FIFO_PNL_SHEET]
+    for r in range(PNL_FIRST_DATA_ROW, pnl.max_row + 1):
+        used.update(parse_gl_codes(pnl.cell(row=r, column=PNL_GL_COL).value))
+    out = []
+    for code, val in totals.items():
+        if code in used or not isinstance(val, (int, float)) or val == 0:
+            continue
+        out.append((code, descriptions.get(code) or "", val))
+    return out
 
 
 def parse_gl_codes(cell_value):
@@ -169,14 +196,34 @@ def _retarget_column(formula, from_col, to_col):
     return CELL_REF_RE.sub(_sub, formula)
 
 
-def remap_formula_columns(formula, shift_from_col, delta):
-    def _sub(m):
-        dollar_col, col, dollar_row, row_s = m.groups()
+SHEET_REF_RE = re.compile(
+    r"((?:'[^']+'|[A-Za-z_][A-Za-z0-9_]*)!)?(\$?)([A-Z]{1,3})(\$?)(\d{1,4})(?::(\$?)([A-Z]{1,3})(\$?)(\d{1,4}))?")
+
+# Both sheets grow by the same number of columns each month, but from
+# different anchors, so a reference has to be shifted by the anchor of the
+# sheet it POINTS AT, not the sheet the formula sits in.
+SHEET_ANCHORS = {FIFO_SCH_SHEET: SCH_ANCHOR_COL, FIFO_PNL_SHEET: PNL_ANCHOR_COL}
+
+
+def remap_formula_columns(formula, shift_from_col, delta, own_sheet=None):
+    def bump(col, anchor):
         idx = column_index_from_string(col)
-        if idx >= shift_from_col:
-            col = get_column_letter(idx + delta)
-        return f"{dollar_col}{col}{dollar_row}{row_s}"
-    return CELL_REF_RE.sub(_sub, formula)
+        return get_column_letter(idx + delta) if idx >= anchor else col
+
+    def _sub(m):
+        prefix, d1, c1, d2, r1, d3, c2, d4, r2 = m.groups()
+        if prefix:
+            sheet = prefix[:-1].strip("'")
+            anchor = SHEET_ANCHORS.get(sheet)
+            if anchor is None:
+                return m.group(0)   # some other sheet: not ours to shift
+        else:
+            anchor = shift_from_col
+        out = f"{prefix or ''}{d1}{bump(c1, anchor)}{d2}{r1}"
+        if c2:
+            out += f":{d3}{bump(c2, anchor)}{d4}{r2}"
+        return out
+    return SHEET_REF_RE.sub(_sub, formula)
 
 
 def remap_formula_columns_bounded(formula, from_col, to_col_inclusive, delta):
@@ -228,7 +275,7 @@ def shift_columns_and_style(ws, anchor_col, insert_count, max_row, real_cols):
             cell = ws.cell(row=r, column=c)
             val = cell.value
             if isinstance(val, str) and val.startswith('='):
-                val = remap_formula_columns(val, anchor_col, insert_count)
+                val = remap_formula_columns(val, anchor_col, insert_count, ws.title)
             snapshot[(r, c)] = {"value": val, "style": copy.copy(cell._style)}
 
     for r in range(1, max_row + 1):
@@ -261,6 +308,9 @@ def classify_movement_formula(formula, row):
     m = DIFF_WITH_TAIL_RE.match(formula)
     if m and int(m.group(1)) == row:
         return "adjustment_dropped", exact_diff
+    m = NUMERIC_TAIL_RE.match(formula)
+    if m:   # e.g. "=-H36-26198033": a one-off number bolted on for one month
+        return "adjustment_dropped", m.group(1)
     return "template", formula  # subtotal / cross-reference — copy verbatim
 
 
@@ -303,11 +353,15 @@ def classify_amount_formula(formula, prev_month, new_month):
 
 
 def process_fifo_sch(ws, totals, new_month, is_new_year_start):
-    real_cols = get_real_month_columns(ws, SCH_DATE_ROW, SCH_ANCHOR_COL)
+    # Shift everything from the anchor to the sheet's last used column, not
+    # just the dated month columns: the client keeps side notes to the right
+    # of the months, and a month-only shift wrote straight over them.
+    real_cols = list(range(SCH_ANCHOR_COL, max(ws.max_column, SCH_ANCHOR_COL) + 1))
     max_row = ws.max_row
     insert_count = 1 if is_new_year_start else 2
 
     captured = shift_columns_and_style(ws, SCH_ANCHOR_COL, insert_count, max_row, real_cols)
+    old_amount_col = SCH_ANCHOR_COL + 1 + insert_count   # where last month's amount now sits
 
     amount_col = SCH_ANCHOR_COL if is_new_year_start else SCH_ANCHOR_COL + 1
     movement_col = None if is_new_year_start else SCH_ANCHOR_COL
@@ -342,13 +396,40 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
             if suggestion is not None:
                 suggestions[r] = suggestion
 
+    sign_flipped = []
+    opening_carried = []
+
     for r in range(SCH_FIRST_DATA_ROW, max_row + 1):
         code_cell = ws.cell(row=r, column=SCH_GL_COL).value
         desc = ws.cell(row=r, column=SCH_DESC_COL).value
         codes = parse_gl_codes(code_cell)
 
-        if codes:
+        old_amt = ws.cell(row=r, column=old_amount_col).value
+        is_opening = bool(codes) and all(c.startswith("X1") for c in codes)
+        is_closing = bool(codes) and all(c.startswith("R3") for c in codes)
+
+        if is_opening:
+            # Opening stock is fixed for the whole fiscal year. Sheet1's
+            # X1xxx balances are book figures that differ from the costed
+            # opening stock kept here, and (having been overwritten by them)
+            # this used to pick up the closing-stock figure by mistake.
+            has_refs = isinstance(old_amt, str) and old_amt.startswith("=") and CELL_REF_RE.search(old_amt)
+            if is_new_year_start or old_amt is None or has_refs:
+                apply_manual_amount(r, desc)
+            else:
+                ws.cell(row=r, column=amount_col).value = old_amt
+                opening_carried.append((r, code_cell, desc))
+        elif codes:
             value, any_missing, all_missing = sum_for_codes(codes, totals)
+            if not all_missing and is_closing:
+                # this sheet keeps closing stock as a deduction (negative);
+                # Sheet1 shows it as a positive balance. Follow whatever sign
+                # the previous month used.
+                was_negative = (isinstance(old_amt, (int, float)) and old_amt < 0) or \
+                    (isinstance(old_amt, str) and old_amt.startswith("=-"))
+                if was_negative:
+                    value = -value
+                    sign_flipped.append((r, code_cell, desc))
             if all_missing:
                 # none of these codes are tracked by Sheet1 at all (e.g. the
                 # FIFO stock rollforward, Audit Fees) — treat as manual
@@ -377,6 +458,8 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
         "manual_rows": manual_rows,
         "amount_col": amount_col,
         "suggestions": suggestions,
+        "sign_flipped": sign_flipped,
+        "opening_carried": opening_carried,
     }
 
 
@@ -414,7 +497,7 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
                 cell = ws.cell(row=r, column=c)
                 val = cell.value
                 if isinstance(val, str) and val.startswith('='):
-                    val = remap_formula_columns(val, ratio_anchor, total_ratio_shift)
+                    val = remap_formula_columns(val, ratio_anchor, total_ratio_shift, ws.title)
                 ratio_snapshot[(r, c)] = {"value": val, "style": copy.copy(cell._style)}
 
     # Step 1: shift the main block AND its one spacer column by insert_count.
@@ -455,6 +538,13 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
 
     amount_col = PNL_ANCHOR_COL if is_new_year_start else PNL_ANCHOR_COL + 1
     movement_col = None if is_new_year_start else PNL_ANCHOR_COL
+
+    for tr in range(1, PNL_HEADER_ROW):
+        for tc in range(1, 8):
+            v = ws.cell(row=tr, column=tc).value
+            if isinstance(v, str) and TITLE_DATE_RE.search(v):
+                ws.cell(row=tr, column=tc).value = TITLE_DATE_RE.sub(
+                    lambda m: m.group(1) + fmt_sch_date(new_month), v)
 
     month_str = new_month.strftime("%B-%Y")
     ws.cell(row=PNL_HEADER_ROW, column=amount_col).value = f"As on                    {month_str}"
@@ -576,6 +666,7 @@ def _year_month(d):
 
 def apply_new_month(wb, sheet1_ws):
     totals, new_month, gross_sales = read_sheet1_totals(sheet1_ws)
+    unmapped = find_unmapped_codes(wb, totals, read_sheet1_descriptions(sheet1_ws))
 
     current_month = get_current_month(wb)
     if current_month is not None and _year_month(new_month) <= _year_month(current_month):
@@ -608,6 +699,9 @@ def apply_new_month(wb, sheet1_ws):
         "pnl_gl_rows": pnl_report["gl_rows"],
         "gross_sales_status": pnl_report["gross_sales_status"],
         "suggestions": sch_report["suggestions"],
+        "sign_flipped": sch_report["sign_flipped"],
+        "opening_carried": sch_report["opening_carried"],
+        "unmapped_codes": unmapped,
     }
 
 
@@ -661,9 +755,17 @@ def replace_latest_month(wb, sheet1_ws):
         codes = parse_gl_codes(sch_ws.cell(row=r, column=SCH_GL_COL).value)
         if not codes:
             continue
+        if all(c.startswith("X1") for c in codes):
+            continue  # opening stock is carried forward, never taken from Sheet1
         value, any_missing, all_missing = sum_for_codes(codes, totals)
         if all_missing:
             continue  # permanently-manual row — leave whatever is already there
+        if all(c.startswith("R3") for c in codes):
+            here = sch_ws.cell(row=r, column=sch_amount_col).value
+            before = sch_ws.cell(row=r, column=sch_amount_col + 2).value
+            if any((isinstance(v, (int, float)) and v < 0) or (isinstance(v, str) and v.startswith("=-"))
+                   for v in (here, before)):
+                value = -value
         sch_ws.cell(row=r, column=sch_amount_col).value = value
         gl_rows_updated.append((r, sch_ws.cell(row=r, column=SCH_GL_COL).value,
                                  sch_ws.cell(row=r, column=SCH_DESC_COL).value))
