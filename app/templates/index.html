@@ -217,6 +217,7 @@
         <h1>Monthly Update</h1>
       </div>
       <div style="display:flex; gap:10px; margin-top:4px;">
+        <a href="/history" style="font-size:12.5px; color:var(--muted); text-decoration:none; font-weight:600;">History</a>
         <a href="/change-password" style="font-size:12.5px; color:var(--muted); text-decoration:none; font-weight:600;">Change password</a>
         <form action="/logout" method="post" style="display:inline;">
           <button type="submit" style="background:none; border:none; color:var(--muted); font-size:12.5px; font-weight:600; cursor:pointer; padding:0; font-family:inherit;">Log out</button>
@@ -273,7 +274,7 @@
 
       <div class="undo-row">
         <span>{% if can_undo %}You can revert the last change if something looks wrong.{% else %}No previous version available to undo.{% endif %}</span>
-        <form action="/undo" method="post" onsubmit="return confirm('Revert the P&amp;L workbook to its state before the last change?');">
+        <form action="/undo" method="post" onsubmit="return confirm('Undo the last change?\n\n{% for l in undo_lines %}{{ l }}\n{% endfor %}\nYou can bring this version back later from History.');">
           <button class="undo" type="submit" {% if not can_undo %}disabled{% endif %}>Undo last change</button>
         </form>
       </div>
@@ -281,7 +282,7 @@
 
     {% if recent %}
     <div class="card" style="margin-top:16px;">
-      <label class="field-label">Download the file from last time</label>
+      <label class="field-label">Download the file from last time <a href="/history" style="font-weight:600; font-size:12.5px; color:var(--accent-dark); margin-left:8px;">All versions →</a></label>
       {% for f in recent %}
       <div class="undo-row" style="margin-top:8px;">
         <span><strong style="color:var(--ink);">{{ f.label }}</strong> — {{ f.filename }}<br>saved {{ f.when }}</span>

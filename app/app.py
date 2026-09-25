@@ -12,6 +12,9 @@ from sheet1_formulas import read_total_formulas
 import transform_type1 as t1
 import transform_type2 as t2
 import auth
+import json
+import io
+from history import HistoryLog, earlier_month_changes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
@@ -24,6 +27,9 @@ HISTORY_DIR = os.path.join(BASE_DIR, "history")
 PENDING_DIR = os.path.join(BASE_DIR, "pending")
 PENDING_PNL_PATH = os.path.join(PENDING_DIR, "pending_pnl.xlsx")
 PENDING_ACPLACT_PATH = os.path.join(PENDING_DIR, "pending_acplact.xlsx")
+
+HISTORY = HistoryLog(HISTORY_DIR)
+META_PATH = os.path.join(PENDING_DIR, "meta.json")
 
 for d in (UPLOAD_DIR, OUTPUT_DIR, HISTORY_DIR, PENDING_DIR):
     os.makedirs(d, exist_ok=True)
@@ -320,6 +326,7 @@ def index():
         pnl_month=pnl_month,
         acplact_month=acplact_month,
         can_undo=can_undo,
+        undo_lines=undo_preview() if can_undo else [],
         recent=recent_outputs(),
     )
 
@@ -344,6 +351,8 @@ def process():
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     upload_path = os.path.join(UPLOAD_DIR, f"sheet1_{ts}.xlsx")
     file.save(upload_path)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump({"source": file.filename}, f)
 
     sections = []
 
@@ -427,6 +436,11 @@ def confirm():
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     downloads = []
+    try:
+        with open(META_PATH, encoding="utf-8") as f:
+            source_name = json.load(f).get("source", "")
+    except (OSError, ValueError):
+        source_name = ""
 
     if ran_pnl:
         pnl_wb = openpyxl.load_workbook(PENDING_PNL_PATH)
@@ -454,7 +468,10 @@ def confirm():
         output_name = f"P&L STATEMENT ({new_month}).xlsx"
         output_path = os.path.join(OUTPUT_DIR, output_name)
         pnl_wb.save(output_path)
-        downloads.append({"label": "PNL", "filename": output_name, "edited": edited})
+        changes = earlier_month_changes("PNL", backup_path, PNL_PATH, mode_key)
+        HISTORY.add("PNL", MODES[mode_key]["label"], new_month, PNL_PATH, ts, edited, source_name, changes)
+        downloads.append({"label": "PNL", "filename": output_name, "edited": edited,
+                          "changes": changes[:50], "changed_count": len(changes)})
         os.remove(PENDING_PNL_PATH)
 
     if ran_acplact:
@@ -488,7 +505,11 @@ def confirm():
         output_name = f"acplact ({new_month}).xlsx"
         output_path = os.path.join(OUTPUT_DIR, output_name)
         acplact_wb.save(output_path)
-        downloads.append({"label": "ACPLACT", "filename": output_name, "edited": acplact_edited})
+        changes = earlier_month_changes("ACPLACT", backup_path, ACPLACT_PATH, mode_key)
+        HISTORY.add("ACPLACT", MODES[mode_key]["label"], new_month, ACPLACT_PATH, ts, acplact_edited,
+                    source_name, changes)
+        downloads.append({"label": "ACPLACT", "filename": output_name, "edited": acplact_edited,
+                          "changes": changes[:50], "changed_count": len(changes)})
         os.remove(PENDING_ACPLACT_PATH)
 
     return render_template("result.html", downloads=downloads, mode_label=MODES[mode_key]["label"])
@@ -503,6 +524,33 @@ def cancel():
     return redirect(url_for("index"))
 
 
+def _file_month(path, label):
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        d = t2.get_current_month(wb) if label == "ACPLACT" else t1.get_current_pnl_month(wb["P&L"])
+        return d.strftime("%B %Y") if d else "no data"
+    except Exception:
+        return "unknown"
+
+
+def _backup_target(backup):
+    return (ACPLACT_PATH, "ACPLACT") if os.path.basename(backup).startswith("acplact_before_") \
+        else (PNL_PATH, "PNL")
+
+
+def undo_preview():
+    """Plain-English list of what Undo would do right now."""
+    lines = []
+    for backup in latest_backup_batch():
+        target, label = _backup_target(backup)
+        now, then = _file_month(target, label), _file_month(backup, label)
+        if now == then:
+            lines.append(f"{label}: stays at {now}, but its figures go back to how they were before the last replace")
+        else:
+            lines.append(f"{label}: goes back from {now} to {then}")
+    return lines
+
+
 @app.route("/undo", methods=["POST"])
 def undo():
     backups = latest_backup_batch()
@@ -510,18 +558,67 @@ def undo():
         flash("No previous version to restore to.", "error")
         return redirect(url_for("index"))
 
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     reverted = []
     for backup in backups:
-        name = os.path.basename(backup)
-        if name.startswith("acplact_before_"):
-            target, label = ACPLACT_PATH, "ACPLACT"
-        else:
-            target, label = PNL_PATH, "PNL"
+        target, label = _backup_target(backup)
         shutil.copy(backup, target)
         os.remove(backup)
-        reverted.append(label)
+        HISTORY.add(label, "Undo", _file_month(target, label), target, ts,
+                    note="Reverted to the version before the previous change")
+        reverted.append(f"{label} (now {_file_month(target, label)})")
 
     flash(f"Reverted {' and '.join(reverted)} to their previous version.", "ok")
+    return redirect(url_for("index"))
+
+
+@app.route("/history")
+def history_page():
+    entries = list(reversed(HISTORY.entries()))
+    return render_template("history.html", entries=entries,
+                           pnl_month=get_pnl_current_month(), acplact_month=get_acplact_current_month())
+
+
+@app.route("/history/<entry_id>")
+def history_detail(entry_id):
+    entry = HISTORY.get(entry_id)
+    if not entry:
+        flash("That history entry was not found.", "error")
+        return redirect(url_for("history_page"))
+    return render_template("history_detail.html", e=entry)
+
+
+@app.route("/history/<entry_id>/download")
+def history_download(entry_id):
+    entry = HISTORY.get(entry_id)
+    if not entry or not os.path.isfile(HISTORY.version_path(entry)):
+        flash("Saved copy not found.", "error")
+        return redirect(url_for("history_page"))
+    buf = io.BytesIO()
+    wb = openpyxl.load_workbook(HISTORY.version_path(entry))
+    if entry["kind"] == "PNL" and "Sheet1" in wb.sheetnames:
+        wb.remove(wb["Sheet1"])
+    wb.save(buf)
+    buf.seek(0)
+    base = "P&L STATEMENT" if entry["kind"] == "PNL" else "acplact"
+    return send_file(buf, as_attachment=True,
+                     download_name=f"{base} ({entry['month']}, saved {entry['id'][:8]}-{entry['id'][9:15]}).xlsx")
+
+
+@app.route("/history/<entry_id>/restore", methods=["POST"])
+def history_restore(entry_id):
+    entry = HISTORY.get(entry_id)
+    if not entry or not os.path.isfile(HISTORY.version_path(entry)):
+        flash("Saved copy not found.", "error")
+        return redirect(url_for("history_page"))
+    target, name = (PNL_PATH, "P&L") if entry["kind"] == "PNL" else (ACPLACT_PATH, "acplact")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if os.path.isfile(target):   # keep what is there now, so Undo can reverse this too
+        shutil.copy(target, os.path.join(HISTORY_DIR, f"{name}_before_restore_{ts}.xlsx"))
+    shutil.copy(HISTORY.version_path(entry), target)
+    HISTORY.add(entry["kind"], "Restore", entry["month"], target, ts,
+                note=f"Restored the version saved {entry['when']}")
+    flash(f"Restored {entry['kind']} to the version saved {entry['when']} ({entry['month']}).", "ok")
     return redirect(url_for("index"))
 
 

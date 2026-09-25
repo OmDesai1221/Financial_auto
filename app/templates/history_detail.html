@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>History detail</title>
+  <style>
+    :root { --ink:#1a1d23; --muted:#6b7280; --border:#e5e7eb; --bg:#f6f7f9; --card:#fff; --accent:#2f6f4e; --accent-dark:#245a3f; --warn:#9b1c1c; }
+    * { box-sizing: border-box; }
+    body { font-family:"Segoe UI",-apple-system,Arial,sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:48px 20px 80px; }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    h1 { font-size:24px; margin:0 0 6px; }
+    .hint { font-size:13px; color:var(--muted); margin:0 0 18px; }
+    a.back { color:var(--accent-dark); font-weight:600; font-size:13.5px; text-decoration:none; }
+    table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--border); border-radius:10px; overflow:hidden; font-size:13px; }
+    th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top; }
+    th { background:#fafafa; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+    .pill { display:inline-block; font-size:11.5px; font-weight:700; padding:2px 8px; border-radius:99px; background:#eaf3ee; color:var(--accent-dark); }
+    .pill.bad { background:#fde8e8; color:var(--warn); }
+    .btn { display:inline-block; font-size:12.5px; font-weight:600; padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:#fff; color:var(--accent-dark); text-decoration:none; cursor:pointer; font-family:inherit; }
+    .btn.danger { color:var(--warn); }
+    form { display:inline; }
+    .flash { padding:12px 16px; border-radius:10px; margin-bottom:16px; font-size:13.5px; }
+    .flash.error { background:#fde8e8; color:#9b1c1c; } .flash.ok { background:#eaf3ee; color:#245a3f; }
+    .mono { font-family:Consolas,monospace; word-break:break-all; }
+  </style>
+</head>
+<body><div class="wrap">
+<a class="back" href="/">&larr; Back</a>
+{% with messages = get_flashed_messages(with_categories=true) %}{% for category, msg in messages %}<div class="flash {{ category }}">{{ msg }}</div>{% endfor %}{% endwith %}
+
+<h1>{{ e.kind }} — {{ e.action }} — {{ e.month }}</h1>
+<p class="hint">Saved {{ e.when }}{% if e.source_file %} from <strong>{{ e.source_file }}</strong>{% endif %}. {{ e.note }}</p>
+<p><a class="btn" href="/history/{{ e.id }}/download">Download this version</a></p>
+{% if e.changed_count %}
+<h2 style="font-size:16px;">{{ e.changed_count }} figure(s) of earlier months changed in this save</h2>
+<p class="hint">Compared with the file just before this save, matched by GL code / description and month. Cells that are formulas on both sides are not compared, because adding rows or columns rewrites their references.{% if e.changed_count > e.changes|length %} Showing the first {{ e.changes|length }}.{% endif %}</p>
+<table><thead><tr><th>Sheet</th><th>Row (GL code / description)</th><th>Month</th><th>Column</th><th>Before</th><th>After</th></tr></thead><tbody>
+{% for c in e.changes %}<tr><td>{{ c.sheet }}</td><td>{{ c.row }}</td><td>{{ c.month }}</td><td>{{ c.kind or "value" }}</td><td class="mono">{{ c.old }}</td><td class="mono">{{ c.new }}</td></tr>{% endfor %}
+</tbody></table>
+{% elif e.action not in ("Undo","Restore") %}<p><span class="pill">No figures of earlier months changed in this save.</span></p>{% endif %}
+</div></body></html>

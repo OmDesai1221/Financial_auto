@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>History</title>
+  <style>
+    :root { --ink:#1a1d23; --muted:#6b7280; --border:#e5e7eb; --bg:#f6f7f9; --card:#fff; --accent:#2f6f4e; --accent-dark:#245a3f; --warn:#9b1c1c; }
+    * { box-sizing: border-box; }
+    body { font-family:"Segoe UI",-apple-system,Arial,sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:48px 20px 80px; }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    h1 { font-size:24px; margin:0 0 6px; }
+    .hint { font-size:13px; color:var(--muted); margin:0 0 18px; }
+    a.back { color:var(--accent-dark); font-weight:600; font-size:13.5px; text-decoration:none; }
+    table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--border); border-radius:10px; overflow:hidden; font-size:13px; }
+    th, td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); vertical-align:top; }
+    th { background:#fafafa; font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+    .pill { display:inline-block; font-size:11.5px; font-weight:700; padding:2px 8px; border-radius:99px; background:#eaf3ee; color:var(--accent-dark); }
+    .pill.bad { background:#fde8e8; color:var(--warn); }
+    .btn { display:inline-block; font-size:12.5px; font-weight:600; padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:#fff; color:var(--accent-dark); text-decoration:none; cursor:pointer; font-family:inherit; }
+    .btn.danger { color:var(--warn); }
+    form { display:inline; }
+    .flash { padding:12px 16px; border-radius:10px; margin-bottom:16px; font-size:13.5px; }
+    .flash.error { background:#fde8e8; color:#9b1c1c; } .flash.ok { background:#eaf3ee; color:#245a3f; }
+    .mono { font-family:Consolas,monospace; word-break:break-all; }
+  </style>
+</head>
+<body><div class="wrap">
+<a class="back" href="/">&larr; Back</a>
+{% with messages = get_flashed_messages(with_categories=true) %}{% for category, msg in messages %}<div class="flash {{ category }}">{{ msg }}</div>{% endfor %}{% endwith %}
+
+<h1>History</h1>
+<p class="hint">Every save made by this tool, newest first. Currently: PNL <strong>{{ pnl_month or "—" }}</strong>, ACPLACT <strong>{{ acplact_month or "—" }}</strong>.
+Each row keeps a full copy of the file as it was right after that save — download it to compare, or restore it if it was the correct one.
+"Earlier-month changes" counts figures of previous months that differ from before that save (should normally be 0).</p>
+{% if not entries %}<p class="hint">Nothing recorded yet — entries appear after the first save.</p>{% else %}
+<table>
+<thead><tr><th>When</th><th>File</th><th>What</th><th>Month</th><th>Source</th><th>Earlier-month changes</th><th></th></tr></thead>
+<tbody>
+{% for e in entries %}
+<tr>
+  <td>{{ e.when }}</td>
+  <td><strong>{{ e.kind }}</strong></td>
+  <td>{{ e.action }}{% if e.edited %}<br><span class="hint">{{ e.edited }} manual edit(s)</span>{% endif %}{% if e.note %}<br><span class="hint">{{ e.note }}</span>{% endif %}</td>
+  <td>{{ e.month }}</td>
+  <td>{{ e.source_file or "—" }}</td>
+  <td>{% if e.action in ("Undo","Restore") %}—{% elif e.changed_count %}<span class="pill bad">{{ e.changed_count }} changed</span>{% else %}<span class="pill">none</span>{% endif %}</td>
+  <td style="white-space:nowrap;">
+    <a class="btn" href="/history/{{ e.id }}">Details</a>
+    <a class="btn" href="/history/{{ e.id }}/download">Download</a>
+    <form action="/history/{{ e.id }}/restore" method="post" onsubmit="return confirm('Make the {{ e.kind }} file exactly as it was after this save ({{ e.month }}, saved {{ e.when }})?\n\nThe current file is kept, and Undo can reverse this.');">
+      <button class="btn danger" type="submit">Restore</button>
+    </form>
+  </td>
+</tr>
+{% endfor %}
+</tbody></table>{% endif %}
+</div></body></html>

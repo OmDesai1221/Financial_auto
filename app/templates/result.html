@@ -64,6 +64,17 @@
       </div>
       <a class="button" href="/download/{{ d.filename }}">Download</a>
     </div>
+    {% if d.changed_count %}
+    <div class="card" style="display:block; border-color:#f3c0c0;">
+      <div class="label" style="color:#9b1c1c;">{{ d.label }}: {{ d.changed_count }} figure(s) of earlier months differ from before</div>
+      <div class="edited">Check these — previous months should not normally change. Undo on the first page reverses this save.</div>
+      <div style="font-size:12.5px; margin-top:8px; max-height:220px; overflow:auto;">
+        {% for c in d.changes %}<div>{{ c.sheet }} · {{ c.row }} · {{ c.month }}: {{ c.old }} → {{ c.new }}</div>{% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <p class="hint" style="color:#245a3f;">&#10003; {{ d.label }}: no figures of earlier months changed.</p>
+    {% endif %}
     {% endfor %}
 
     <a class="back" href="/">&larr; Back</a>
