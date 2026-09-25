@@ -47,6 +47,7 @@ Each row keeps a full copy of the file as it was right after that save — downl
   <td>{% if e.action in ("Undo","Restore") %}—{% elif e.changed_count %}<span class="pill bad">{{ e.changed_count }} changed</span>{% else %}<span class="pill">none</span>{% endif %}</td>
   <td style="white-space:nowrap;">
     <a class="btn" href="/history/{{ e.id }}">Details</a>
+    <a class="btn" href="/history/{{ e.id }}/preview">Preview</a>
     <a class="btn" href="/history/{{ e.id }}/download">Download</a>
     <form action="/history/{{ e.id }}/restore" method="post" onsubmit="return confirm('Make the {{ e.kind }} file exactly as it was after this save ({{ e.month }}, saved {{ e.when }})?\n\nThe current file is kept, and Undo can reverse this.');">
       <button class="btn danger" type="submit">Restore</button>

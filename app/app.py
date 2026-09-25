@@ -588,6 +588,42 @@ def history_detail(entry_id):
     return render_template("history_detail.html", e=entry)
 
 
+PREVIEW_MAX_ROWS, PREVIEW_MAX_COLS = 400, 40
+
+
+@app.route("/history/<entry_id>/preview")
+def history_preview(entry_id):
+    entry = HISTORY.get(entry_id)
+    if not entry or not os.path.isfile(HISTORY.version_path(entry)):
+        flash("Saved copy not found.", "error")
+        return redirect(url_for("history_page"))
+    wb = openpyxl.load_workbook(HISTORY.version_path(entry))
+    names = [n for n in wb.sheetnames if not (entry["kind"] == "PNL" and n == "Sheet1")]
+    sheet = request.args.get("sheet", names[0])
+    if sheet not in names:
+        sheet = names[0]
+    ws = wb[sheet]
+    hidden_cols = {k for k, d in ws.column_dimensions.items() if d.hidden and k != "B"}
+    rows = []
+    for r in range(1, min(ws.max_row, PREVIEW_MAX_ROWS) + 1):
+        cells = []
+        for c in range(1, min(ws.max_column, PREVIEW_MAX_COLS) + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, datetime.datetime):
+                v = v.strftime("%d %b %Y")
+            elif isinstance(v, float):
+                v = f"{v:,.2f}"
+            elif isinstance(v, int) and not isinstance(v, bool) and abs(v) >= 1000:
+                v = f"{v:,}"
+            cells.append("" if v is None else str(v))
+        if any(cells):
+            rows.append((r, cells))
+    ncols = min(ws.max_column, PREVIEW_MAX_COLS)
+    return render_template("history_preview.html", e=entry, names=names, sheet=sheet, rows=rows,
+                           ncols=ncols, truncated=ws.max_row > PREVIEW_MAX_ROWS or ws.max_column > PREVIEW_MAX_COLS,
+                           col_letters=[openpyxl.utils.get_column_letter(i) for i in range(1, ncols + 1)])
+
+
 @app.route("/history/<entry_id>/download")
 def history_download(entry_id):
     entry = HISTORY.get(entry_id)

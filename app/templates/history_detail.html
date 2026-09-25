@@ -31,7 +31,9 @@
 
 <h1>{{ e.kind }} — {{ e.action }} — {{ e.month }}</h1>
 <p class="hint">Saved {{ e.when }}{% if e.source_file %} from <strong>{{ e.source_file }}</strong>{% endif %}. {{ e.note }}</p>
-<p><a class="btn" href="/history/{{ e.id }}/download">Download this version</a></p>
+<p><a class="btn" href="/history/{{ e.id }}/preview">Preview</a>
+<a class="btn" href="/history/{{ e.id }}/download">Download this version</a>
+<form action="/history/{{ e.id }}/restore" method="post" onsubmit="return confirm('Make the {{ e.kind }} file exactly as it was after this save ({{ e.month }}, saved {{ e.when }})?\n\nThe current file is kept, and Undo can reverse this.');"><button class="btn danger" type="submit">Restore this version as the main file</button></form></p>
 {% if e.changed_count %}
 <h2 style="font-size:16px;">{{ e.changed_count }} figure(s) of earlier months changed in this save</h2>
 <p class="hint">Compared with the file just before this save, matched by GL code / description and month. Cells that are formulas on both sides are not compared, because adding rows or columns rewrites their references.{% if e.changed_count > e.changes|length %} Showing the first {{ e.changes|length }}.{% endif %}</p>
