@@ -28,6 +28,7 @@ Layout, per month, in both sheets:
 """
 import re
 import copy
+from sheet1_formulas import compose
 import datetime
 from openpyxl.utils import get_column_letter, column_index_from_string
 
@@ -130,6 +131,20 @@ def read_sheet1_totals(sheet1_ws):
     month_num = months.get(m.group(1).lower())
     new_month = datetime.date(int(m.group(2)), month_num, 1)
     return totals, new_month, gross_sales
+
+
+TOTAL_FORMULAS = {}    # code -> Sheet1 arithmetic formula; set per run
+GROSS_FORMULA = None
+
+
+def set_sheet1_formulas(by_code, gross):
+    global TOTAL_FORMULAS, GROSS_FORMULA
+    TOTAL_FORMULAS, GROSS_FORMULA = (by_code or {}), gross
+
+
+def _formula_or_value(codes, totals, value, negate=False):
+    found = [(c, totals[c]) for c in codes if totals.get(c) is not None]
+    return compose(found, TOTAL_FORMULAS, negate) or (-value if negate else value)
 
 
 def read_sheet1_descriptions(sheet1_ws):
@@ -428,14 +443,16 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
                 was_negative = (isinstance(old_amt, (int, float)) and old_amt < 0) or \
                     (isinstance(old_amt, str) and old_amt.startswith("=-"))
                 if was_negative:
-                    value = -value
                     sign_flipped.append((r, code_cell, desc))
+                value = _formula_or_value(codes, totals, value, negate=was_negative)
             if all_missing:
                 # none of these codes are tracked by Sheet1 at all (e.g. the
                 # FIFO stock rollforward, Audit Fees) — treat as manual
                 gl_rows_manual.append((r, code_cell, desc))
                 apply_manual_amount(r, desc)
             else:
+                if not is_closing:
+                    value = _formula_or_value(codes, totals, value)
                 ws.cell(row=r, column=amount_col).value = value
                 if any_missing:
                     gl_rows_partial.append((r, code_cell, desc))
@@ -564,7 +581,7 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
     # other self-referential formula.
     gross_sales_status = "missing"
     if gross_sales is not None:
-        ws.cell(row=PNL_GROSS_SALES_ROW, column=amount_col).value = gross_sales
+        ws.cell(row=PNL_GROSS_SALES_ROW, column=amount_col).value = GROSS_FORMULA or gross_sales
         gross_sales_status = "provided"
     else:
         ws.cell(row=PNL_GROSS_SALES_ROW, column=amount_col).value = None
@@ -589,7 +606,7 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
                 if all_missing:
                     codes = []  # fall through to manual handling below
                 else:
-                    ws.cell(row=r, column=amount_col).value = value
+                    ws.cell(row=r, column=amount_col).value = _formula_or_value(codes, totals, value)
                     gl_rows.append((r, code_cell, desc))
             if not codes:
                 old_amount_off = 1 if 1 in captured[r] else 0
@@ -766,7 +783,13 @@ def replace_latest_month(wb, sheet1_ws):
             if any((isinstance(v, (int, float)) and v < 0) or (isinstance(v, str) and v.startswith("=-"))
                    for v in (here, before)):
                 value = -value
-        sch_ws.cell(row=r, column=sch_amount_col).value = value
+                negate = True
+            else:
+                negate = False
+        else:
+            negate = False
+        sch_ws.cell(row=r, column=sch_amount_col).value = _formula_or_value(
+            codes, totals, abs(value) if negate else value, negate)
         gl_rows_updated.append((r, sch_ws.cell(row=r, column=SCH_GL_COL).value,
                                  sch_ws.cell(row=r, column=SCH_DESC_COL).value))
         if any_missing:
@@ -783,13 +806,13 @@ def replace_latest_month(wb, sheet1_ws):
         value, any_missing, all_missing = sum_for_codes(codes, totals)
         if all_missing:
             continue
-        pnl_ws.cell(row=r, column=pnl_amount_col).value = value
+        pnl_ws.cell(row=r, column=pnl_amount_col).value = _formula_or_value(codes, totals, value)
         pnl_gl_rows_updated.append((r, pnl_ws.cell(row=r, column=PNL_GL_COL).value,
                                      pnl_ws.cell(row=r, column=PNL_DESC_COL).value))
 
     gross_sales_status = "missing"
     if gross_sales is not None:
-        pnl_ws.cell(row=PNL_GROSS_SALES_ROW, column=pnl_amount_col).value = gross_sales
+        pnl_ws.cell(row=PNL_GROSS_SALES_ROW, column=pnl_amount_col).value = GROSS_FORMULA or gross_sales
         gross_sales_status = "provided"
     sch_amount_letter = get_column_letter(sch_amount_col)
     pnl_ws.cell(row=PNL_NET_SALES_ROW, column=pnl_amount_col).value = \

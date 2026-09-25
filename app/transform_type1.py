@@ -27,6 +27,7 @@ Rules:
   left blank with the previous value offered as a suggestion.
 """
 import re
+from sheet1_formulas import compose
 import copy
 import datetime
 from collections import namedtuple
@@ -141,7 +142,7 @@ def read_sheet1(ws):
             sequence.append(("code", code))
         elif isinstance(desc, str) and desc.strip():
             if desc.strip().lower().startswith(GROSS_SALES_LABEL_PREFIX):
-                gross_sales = row[11].value
+                gross_sales = GROSS_FORMULA or row[11].value
             else:
                 sequence.append(("label", desc))
     return Sheet1Data(month_date, rows, gross_sales, unit_headers, sequence)
@@ -475,6 +476,15 @@ def _match_rows(ws, s1, write_total):
     return max_row, new_codes, adopted, unit_map
 
 
+TOTAL_FORMULAS = {}     # code -> Sheet1 arithmetic formula; set per run
+GROSS_FORMULA = None
+
+
+def set_sheet1_formulas(by_code, gross):
+    global TOTAL_FORMULAS, GROSS_FORMULA
+    TOTAL_FORMULAS, GROSS_FORMULA = (by_code or {}), gross
+
+
 def _fill_gl_rows(ws, s1, unit_map, new_month_date, old_month_cols):
     """Write the newest month for every coded row from Sheet1. Rows whose
     codes are all absent from Sheet1 fall back to the manual-row patterns."""
@@ -485,7 +495,8 @@ def _fill_gl_rows(ws, s1, unit_map, new_month_date, old_month_cols):
         found = [sheet1_by_code[c] for c in codes if c in sheet1_by_code]
         if found:
             total = sum((f["total"] or 0) for f in found)
-            ws.cell(row=r, column=TOTAL_COL).value = total
+            ws.cell(row=r, column=TOTAL_COL).value = compose(
+                [(f["code"], f["total"]) for f in found], TOTAL_FORMULAS) or total
             units = _sum_units(found)
             for col, i in unit_map:
                 ws.cell(row=r, column=col).value = units[i]
@@ -493,9 +504,13 @@ def _fill_gl_rows(ws, s1, unit_map, new_month_date, old_month_cols):
                 partial.append((r, code_cell, desc))
         elif old_month_cols:
             old_val = ws.cell(row=r, column=old_month_cols[0]).value
-            if old_val in (None, 0):
-                ws.cell(row=r, column=TOTAL_COL).value = 0  # inactive account: stays 0
-                manual.append((r, desc, "flat-value"))
+            if not (isinstance(old_val, str) and old_val.startswith("=")):
+                # A coded row that Sheet1 doesn't list this month has a zero
+                # balance. Only rows kept as a live formula (accruals such as
+                # audit fees) are worth carrying forward; a plain number is
+                # last month's figure, not this month's.
+                ws.cell(row=r, column=TOTAL_COL).value = 0
+                manual.append((r, desc, "zeroed" if old_val not in (None, 0) else "flat-value"))
                 continue
             tag = classify_and_fill_manual_row(ws, r, new_month_date, old_month_cols)
             manual.append((r, desc, tag))

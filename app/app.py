@@ -8,6 +8,7 @@ from flask import Flask, request, render_template, send_file, redirect, url_for,
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 
+from sheet1_formulas import read_total_formulas
 import transform_type1 as t1
 import transform_type2 as t2
 import auth
@@ -350,6 +351,14 @@ def process():
         uploaded_wb = openpyxl.load_workbook(upload_path, data_only=True)
         uploaded_ws = uploaded_wb["Sheet1"] if "Sheet1" in uploaded_wb.sheetnames \
             else uploaded_wb.worksheets[0]
+        # same file again with formulas intact, so arithmetic typed in Sheet1
+        # (e.g. "=600000/12*5") stays visible in the output cells
+        formulas_wb = openpyxl.load_workbook(upload_path)
+        formulas_ws = formulas_wb["Sheet1"] if "Sheet1" in formulas_wb.sheetnames \
+            else formulas_wb.worksheets[0]
+        by_code, gross_formula = read_total_formulas(formulas_ws)
+        t1.set_sheet1_formulas(by_code, gross_formula)
+        t2.set_sheet1_formulas(by_code, gross_formula)
 
         if "pnl" in selected:
             if not os.path.isfile(PNL_PATH):
