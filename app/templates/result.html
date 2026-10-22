@@ -62,6 +62,7 @@
         <div class="label">{{ d.label }}</div>
         {% if d.edited %}<div class="edited">{{ d.edited }} manual edit(s) applied</div>{% endif %}
         {% if d.new_fields_added %}<div class="edited">{{ d.new_fields_added|length }} new field(s) added as their own row</div>{% endif %}
+        {% if d.fields_merged %}<div class="edited">{{ d.fields_merged|length }} new field(s) added into an existing row</div>{% endif %}
       </div>
       <a class="button" href="/download/{{ d.filename }}">Download</a>
     </div>

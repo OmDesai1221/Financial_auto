@@ -207,6 +207,41 @@ def find_sections(ws):
     return sections
 
 
+def list_sch_rows(ws):
+    """Every existing GL-coded FIFO-sch row — the candidates a new Sheet1
+    code could be folded INTO (e.g. a new interest code added alongside
+    "Interest on Cash Credit Facilities & Other", the same way several
+    codes already sit together in that row), as an alternative to giving
+    it a standalone new row."""
+    out = []
+    for r in range(SCH_FIRST_DATA_ROW, ws.max_row + 1):
+        code = ws.cell(row=r, column=SCH_GL_COL).value
+        if code:
+            desc = " ".join(str(ws.cell(row=r, column=SCH_DESC_COL).value or "").split())
+            out.append({"row": r, "desc": desc, "code": code})
+    return out
+
+
+def merge_code_into_row(ws, row, code, value, amount_col):
+    """Add a new GL code into an existing row's code cell, and its value
+    into that row's current-month amount cell — written as an explicit
+    addition (e.g. "=(old)+(new)") rather than collapsed into one opaque
+    number, so the calculation is still visible in the formula bar."""
+    code_cell = ws.cell(row=row, column=SCH_GL_COL)
+    existing_codes = parse_gl_codes(code_cell.value)
+    if code not in existing_codes:
+        code_cell.value = f"{code_cell.value},{code}" if code_cell.value else code
+
+    add_text = value[1:] if isinstance(value, str) and value.startswith('=') else str(value)
+    amt_cell = ws.cell(row=row, column=amount_col)
+    old = amt_cell.value
+    if isinstance(old, str) and old.startswith('='):
+        amt_cell.value = old + f"+({add_text})"
+    else:
+        base = old if old not in (None, "") else 0
+        amt_cell.value = f"=({base})+({add_text})"
+
+
 def insert_new_sch_rows(ws, assignments):
     """assignments: [{"code", "desc", "value", "insert_before"}], where
     insert_before is a section's subtotal_row (from find_sections) — the

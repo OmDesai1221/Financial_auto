@@ -211,6 +211,7 @@ def build_pnl_review_rows(ws, report):
             "desc": desc or "",
             "value": value,
             "source": SOURCE_LABELS.get(source, source),
+            "tag": source,
             "needs_attention": source in NEEDS_ATTENTION_TAGS,
         })
     return rows
@@ -396,6 +397,7 @@ def process():
             acplact_wb.save(PENDING_ACPLACT_PATH)
 
             sch_sections = t2.find_sections(acplact_wb[t2.FIFO_SCH_SHEET])
+            sch_merge_targets = t2.list_sch_rows(acplact_wb[t2.FIFO_SCH_SHEET])
             new_field_candidates = []
             for code, desc, amt in report.get("unmapped_codes", []):
                 formula = t2.TOTAL_FORMULAS.get(code)
@@ -413,6 +415,7 @@ def process():
                 "editable": False,
                 "editable_rows": build_acplact_editable_rows(acplact_wb, report),
                 "sch_sections": sch_sections,
+                "sch_merge_targets": sch_merge_targets,
                 "new_field_candidates": new_field_candidates,
                 "dup_conflicts": dup_conflicts,
             })
@@ -517,22 +520,29 @@ def confirm():
         section_by_name = {s["name"]: s for s in t2.find_sections(sch_ws)}
         nf_indices = {k[len("nf_section_"):] for k in request.form if k.startswith("nf_section_")}
         new_field_assignments = []
-        new_fields_skipped = []
+        merged_fields = []
         for idx in nf_indices:
-            section_name = request.form.get(f"nf_section_{idx}", "").strip()
+            dest = request.form.get(f"nf_section_{idx}", "").strip()
             code = request.form.get(f"nf_code_{idx}", "").strip()
             desc = request.form.get(f"nf_desc_{idx}", "").strip()
-            if not section_name or not code:
-                continue
-            section = section_by_name.get(section_name)
-            if not section:
-                new_fields_skipped.append((code, desc))
+            if not dest or not code:
                 continue
             raw_value = request.form.get(f"nf_value_{idx}", "")
-            new_field_assignments.append({
-                "code": code, "desc": f"    {desc}" if desc else f"    {code}",
-                "value": parse_edited_value(raw_value), "insert_before": section["item_end"] + 1,
-            })
+            value = parse_edited_value(raw_value)
+            if dest.startswith("row::"):
+                # merges don't change row numbers, so these can be applied
+                # right away, using the original (still-valid) row number —
+                # do this BEFORE any new-row insertion below, which does shift rows
+                target_row = int(dest[len("row::"):])
+                t2.merge_code_into_row(sch_ws, target_row, code, value, sch_amount_col)
+                merged_fields.append((target_row, code, desc))
+            elif dest.startswith("sec::"):
+                section = section_by_name.get(dest[len("sec::"):])
+                if section:
+                    new_field_assignments.append({
+                        "code": code, "desc": f"    {desc}" if desc else f"    {code}",
+                        "value": value, "insert_before": section["item_end"] + 1,
+                    })
         new_rows = t2.insert_new_sch_rows(sch_ws, new_field_assignments)
 
         new_month = t2.get_current_month(acplact_wb).isoformat()
@@ -548,7 +558,7 @@ def confirm():
                     source_name, changes)
         downloads.append({"label": "ACPLACT", "filename": output_name, "edited": acplact_edited,
                           "changes": changes[:50], "changed_count": len(changes),
-                          "new_fields_added": new_rows})
+                          "new_fields_added": new_rows, "fields_merged": merged_fields})
         os.remove(PENDING_ACPLACT_PATH)
 
     return render_template("result.html", downloads=downloads, mode_label=MODES[mode_key]["label"])
