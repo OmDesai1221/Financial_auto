@@ -31,6 +31,8 @@ import copy
 from sheet1_formulas import compose
 import datetime
 from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.cell.cell import MergedCell
+from transform_type1 import remap_formula_rows
 
 FIFO_SCH_SHEET = "FIFO-sch"
 FIFO_PNL_SHEET = "FIFO - P & L"
@@ -131,6 +133,137 @@ def read_sheet1_totals(sheet1_ws):
     month_num = months.get(m.group(1).lower())
     new_month = datetime.date(int(m.group(2)), month_num, 1)
     return totals, new_month, gross_sales
+
+
+# ----------------------------------------------------------- conflicts
+
+def find_duplicate_codes(wb):
+    """A Sheet1 code listed in more than one GL-code cell across this
+    workbook gets summed into every one of those rows — silently double
+    (or more) counted. Usually this is a slip made while hand-editing a
+    merged code cell (e.g. a stamp-duty code accidentally left in both the
+    stamp-duty row and a nearby interest row). Returns {code: [(sheet, row,
+    description), ...]} for every code found more than once, so it can be
+    flagged for a person to fix in the GL-code cell directly."""
+    locations = {}
+    sch = wb[FIFO_SCH_SHEET]
+    for r in range(SCH_FIRST_DATA_ROW, sch.max_row + 1):
+        for code in parse_gl_codes(sch.cell(row=r, column=SCH_GL_COL).value):
+            locations.setdefault(code, []).append(
+                (FIFO_SCH_SHEET, r, sch.cell(row=r, column=SCH_DESC_COL).value))
+    pnl = wb[FIFO_PNL_SHEET]
+    for r in range(PNL_FIRST_DATA_ROW, pnl.max_row + 1):
+        for code in parse_gl_codes(pnl.cell(row=r, column=PNL_GL_COL).value):
+            locations.setdefault(code, []).append(
+                (FIFO_PNL_SHEET, r, pnl.cell(row=r, column=PNL_DESC_COL).value))
+    return {code: locs for code, locs in locations.items() if len(locs) > 1}
+
+
+# ------------------------------------------------------- new-field sections
+
+SECTION_HEADER_MAX_INDENT = 1
+PURE_SUM_RE = re.compile(
+    r'^=(?:ROUND\()?SUM\(([A-Z]{1,3})(\d{1,4}):([A-Z]{1,3})(\d{1,4})\)(?:,\s*0\))?$')
+
+
+def _is_section_header(ws, r):
+    code = ws.cell(row=r, column=SCH_GL_COL).value
+    desc = ws.cell(row=r, column=SCH_DESC_COL).value
+    if code or not isinstance(desc, str) or not desc.strip():
+        return False
+    indent = len(desc) - len(desc.lstrip(' '))
+    if indent > SECTION_HEADER_MAX_INDENT:
+        return False
+    cell = ws.cell(row=r, column=SCH_DESC_COL)
+    return bool(cell.font and cell.font.bold)
+
+
+def find_sections(ws):
+    """FIFO-sch's bold, unindented row labels (Cost of Sales, Administration
+    Expenses, Interest & Finance Charges, ...) mark each expense section;
+    each one's subtotal is the next plain '=SUM(<col><start>:<col><end>)'
+    formula found before the NEXT such header (a header with no subtotal of
+    its own in that narrow window — e.g. a repeated/decorative label — is
+    skipped). A brand-new GL code picked for a section is inserted directly
+    above that subtotal row, and the subtotal's own range is widened to
+    include it."""
+    headers = [r for r in range(SCH_FIRST_DATA_ROW, ws.max_row + 1) if _is_section_header(ws, r)]
+    sections = []
+    for i, h in enumerate(headers):
+        window_end = (headers[i + 1] - 1) if i + 1 < len(headers) else ws.max_row
+        subtotal_row, item_end = None, None
+        for r in range(h + 1, window_end + 1):
+            formula = ws.cell(row=r, column=SCH_ANCHOR_COL + 1).value  # amount col
+            m = PURE_SUM_RE.match(formula) if isinstance(formula, str) else None
+            if m:
+                subtotal_row = r
+                item_end = int(m.group(4))   # the range's own last row — a blank
+                break                          # spacer can sit between it and the subtotal
+        if subtotal_row is None:
+            continue  # no subtotal of its own before the next header — skip
+        name = " ".join(str(ws.cell(row=h, column=SCH_DESC_COL).value).split())
+        sections.append({"name": name, "header_row": h, "item_start": h + 1,
+                          "item_end": item_end, "subtotal_row": subtotal_row})
+    return sections
+
+
+def insert_new_sch_rows(ws, assignments):
+    """assignments: [{"code", "desc", "value", "insert_before"}], where
+    insert_before is a section's subtotal_row (from find_sections) — the
+    new row lands directly above it, everything from there down shifts by
+    one, and any formula range ending exactly at that section's last item
+    row grows to include the new row. Older months are left blank for a
+    brand-new row (there's nothing to carry forward)."""
+    if not assignments:
+        return []
+    before_rows = sorted(a["insert_before"] for a in assignments)
+
+    def remap(orig_row):
+        return orig_row + sum(1 for b in before_rows if b <= orig_row)
+
+    def end_extra(orig_row):
+        return sum(1 for a in assignments if a["insert_before"] - 1 == orig_row)
+
+    orig_max_row = ws.max_row
+    max_col = ws.max_column
+    snapshot = {}
+    for r in range(1, orig_max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            val = cell.value
+            if isinstance(val, str) and val.startswith('='):
+                val = remap_formula_rows(val, remap, end_extra)
+            snapshot[(r, c)] = (val, copy.copy(cell._style))
+
+    final_max_row = orig_max_row + len(assignments)
+    for r in range(1, final_max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            if not isinstance(cell, MergedCell):
+                cell.value = None
+    for orig_r in range(1, orig_max_row + 1):
+        final_r = remap(orig_r)
+        for c in range(1, max_col + 1):
+            val, style = snapshot[(orig_r, c)]
+            cell = ws.cell(row=final_r, column=c)
+            if not isinstance(cell, MergedCell):
+                cell.value = val
+            cell._style = copy.copy(style)
+
+    new_rows = []
+    seen_at = {}
+    for a in assignments:
+        slot = remap(a["insert_before"] - 1) + 1 + seen_at.get(a["insert_before"], 0)
+        seen_at[a["insert_before"]] = seen_at.get(a["insert_before"], 0) + 1
+        style_row = slot - 1 if slot > 1 else slot + 1
+        for c in range(1, max_col + 1):
+            ws.cell(row=slot, column=c)._style = copy.copy(ws.cell(row=style_row, column=c)._style)
+        for col, val in ((SCH_GL_COL, a["code"]), (SCH_DESC_COL, a["desc"]), (SCH_ANCHOR_COL + 1, a["value"])):
+            cell = ws.cell(row=slot, column=col)
+            if not isinstance(cell, MergedCell):
+                cell.value = val
+        new_rows.append((slot, a["code"], a["desc"]))
+    return new_rows
 
 
 TOTAL_FORMULAS = {}    # code -> Sheet1 arithmetic formula; set per run

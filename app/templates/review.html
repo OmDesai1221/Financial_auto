@@ -175,11 +175,50 @@
           {% endfor %}
           {% endif %}
 
-          {% if s.report.unmapped_codes %}
-          <div class="tag warn" style="margin-top:10px;">* In Sheet1 but not linked to any row here — these amounts are NOT in the workbook. Type each into the right row (or add its GL code to that row's code cell for next month)</div>
-          {% for code, desc, amt in s.report.unmapped_codes %}
-          <div class="list-line">{{ code }} — {{ desc }} — <strong>{{ "{:,.2f}".format(amt) }}</strong></div>
+          {% if s.dup_conflicts %}
+          <div class="tag warn" style="margin-top:10px;">GL Code listed in more than one row — it's being added into EVERY row below, which is almost certainly wrong. Fix the GL Code cell for whichever row shouldn't have it, then re-upload.</div>
+          {% for code, locs in s.dup_conflicts.items() %}
+          <div class="list-line">{{ code }}: {% for sheet, row, desc in locs %}{{ sheet }} row {{ row }} ({{ (desc or '').strip() }}){% if not loop.last %} <strong>and</strong> {% endif %}{% endfor %}</div>
           {% endfor %}
+          {% endif %}
+
+          {% if s.new_field_candidates %}
+          <div class="tag warn" style="margin-top:10px;">* New in Sheet1, not in this workbook yet — pick which section it belongs under, or leave as "Don't add this month" and place it by hand later</div>
+          <div class="scroll-table" style="max-height:none;">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:110px;">GL Code</th>
+                  <th>Description</th>
+                  <th style="width:160px;">Amount</th>
+                  <th style="width:230px;">Add under section</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for c in s.new_field_candidates %}
+                <tr>
+                  <td>{{ c.code }}</td>
+                  <td class="desc">{{ c.desc }} <span class="empty-marker" title="New — not yet in the workbook">*</span></td>
+                  <td>
+                    <input class="cell-input" type="text" name="nf_value_{{ loop.index0 }}"
+                           value="{{ c.value }}" data-original="{{ c.value }}">
+                  </td>
+                  <td>
+                    <input type="hidden" name="nf_code_{{ loop.index0 }}" value="{{ c.code }}">
+                    <input type="hidden" name="nf_desc_{{ loop.index0 }}" value="{{ c.desc }}">
+                    <select name="nf_section_{{ loop.index0 }}"
+                            style="width:100%; padding:7px 8px; border:1px solid var(--border); border-radius:8px; font-size:12.5px; color:inherit; background:#fff;">
+                      <option value="">Don't add this month</option>
+                      {% for sec in s.sch_sections %}
+                      <option value="{{ sec.name }}">{{ sec.name }}</option>
+                      {% endfor %}
+                    </select>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
           {% endif %}
 
           {% if s.report.sign_flipped %}

@@ -394,6 +394,17 @@ def process():
             run_fn = t2.apply_new_month if mode_key == "new_month" else t2.replace_latest_month
             report = run_fn(acplact_wb, uploaded_ws)
             acplact_wb.save(PENDING_ACPLACT_PATH)
+
+            sch_sections = t2.find_sections(acplact_wb[t2.FIFO_SCH_SHEET])
+            new_field_candidates = []
+            for code, desc, amt in report.get("unmapped_codes", []):
+                formula = t2.TOTAL_FORMULAS.get(code)
+                value_text = formula if formula else (
+                    f"{amt:,.2f}" if isinstance(amt, float) else str(amt))
+                new_field_candidates.append({"code": code, "desc": (desc or "").strip(),
+                                             "value": value_text})
+            dup_conflicts = t2.find_duplicate_codes(acplact_wb)
+
             sections.append({
                 "key": "acplact",
                 "label": TRANSFORMATIONS["acplact"]["label"],
@@ -401,6 +412,9 @@ def process():
                 "rows": [],
                 "editable": False,
                 "editable_rows": build_acplact_editable_rows(acplact_wb, report),
+                "sch_sections": sch_sections,
+                "new_field_candidates": new_field_candidates,
+                "dup_conflicts": dup_conflicts,
             })
 
         return render_template("review.html", sections=sections, mode_key=mode_key,
@@ -497,6 +511,30 @@ def confirm():
                 cell.value = new_value
                 acplact_edited += 1
 
+        # new GL codes the client assigned to a section on the review page
+        # (row numbers from build above are still valid — only columns were
+        # touched since the review page was built, never rows)
+        section_by_name = {s["name"]: s for s in t2.find_sections(sch_ws)}
+        nf_indices = {k[len("nf_section_"):] for k in request.form if k.startswith("nf_section_")}
+        new_field_assignments = []
+        new_fields_skipped = []
+        for idx in nf_indices:
+            section_name = request.form.get(f"nf_section_{idx}", "").strip()
+            code = request.form.get(f"nf_code_{idx}", "").strip()
+            desc = request.form.get(f"nf_desc_{idx}", "").strip()
+            if not section_name or not code:
+                continue
+            section = section_by_name.get(section_name)
+            if not section:
+                new_fields_skipped.append((code, desc))
+                continue
+            raw_value = request.form.get(f"nf_value_{idx}", "")
+            new_field_assignments.append({
+                "code": code, "desc": f"    {desc}" if desc else f"    {code}",
+                "value": parse_edited_value(raw_value), "insert_before": section["item_end"] + 1,
+            })
+        new_rows = t2.insert_new_sch_rows(sch_ws, new_field_assignments)
+
         new_month = t2.get_current_month(acplact_wb).isoformat()
         backup_path = os.path.join(HISTORY_DIR, f"acplact_before_{mode_key}_{ts}.xlsx")
         shutil.copy(ACPLACT_PATH, backup_path)
@@ -509,7 +547,8 @@ def confirm():
         HISTORY.add("ACPLACT", MODES[mode_key]["label"], new_month, ACPLACT_PATH, ts, acplact_edited,
                     source_name, changes)
         downloads.append({"label": "ACPLACT", "filename": output_name, "edited": acplact_edited,
-                          "changes": changes[:50], "changed_count": len(changes)})
+                          "changes": changes[:50], "changed_count": len(changes),
+                          "new_fields_added": new_rows})
         os.remove(PENDING_ACPLACT_PATH)
 
     return render_template("result.html", downloads=downloads, mode_label=MODES[mode_key]["label"])
