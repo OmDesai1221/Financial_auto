@@ -222,6 +222,36 @@ def list_sch_rows(ws):
     return out
 
 
+# A number written with thousand separators inside a formula, e.g. the
+# "+(1,234,567.89)" an earlier version of merge_code_into_row produced.
+# Excel can't parse that, so it reports the file as corrupt and DELETES the
+# whole formula on open. Only matched when it's a bare parenthesised number
+# (not a function's argument list like SUM(1,2)).
+COMMA_NUMBER_RE = re.compile(r'(?<![A-Za-z0-9_.])\((\s*-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\s*)\)')
+
+
+def fix_comma_numbers(formula):
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+    return COMMA_NUMBER_RE.sub(lambda m: "(" + m.group(1).replace(",", "").strip() + ")", formula)
+
+
+def repair_comma_formulas(wb):
+    """Fixes any already-saved formula with thousand-separator commas in a
+    number (see COMMA_NUMBER_RE). Returns [(sheet, cell, old, new)]."""
+    fixed = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and v.startswith("=") and "," in v:
+                    nv = fix_comma_numbers(v)
+                    if nv != v:
+                        cell.value = nv
+                        fixed.append((ws.title, cell.coordinate, v, nv))
+    return fixed
+
+
 def merge_code_into_row(ws, row, code, value, amount_col):
     """Add a new GL code into an existing row's code cell, and its value
     into that row's current-month amount cell — written as an explicit
@@ -232,7 +262,17 @@ def merge_code_into_row(ws, row, code, value, amount_col):
     if code not in existing_codes:
         code_cell.value = f"{code_cell.value},{code}" if code_cell.value else code
 
-    add_text = value[1:] if isinstance(value, str) and value.startswith('=') else str(value)
+    if value is None or value == "":
+        return   # code recorded on the row; nothing to add to the amount
+    if isinstance(value, str) and value.startswith('='):
+        add_text = fix_comma_numbers(value)[1:]
+    elif isinstance(value, (int, float)):
+        add_text = repr(value)
+    else:
+        try:
+            add_text = repr(float(str(value).replace(",", "").strip()))
+        except ValueError:
+            raise ValueError(f"Can't add {value!r} to row {row}: not a number or formula")
     amt_cell = ws.cell(row=row, column=amount_col)
     old = amt_cell.value
     if isinstance(old, str) and old.startswith('='):

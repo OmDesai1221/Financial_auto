@@ -147,9 +147,11 @@ def parse_edited_value(text):
     if text == "":
         return None
     if text.startswith("="):
-        return text
+        return t2.fix_comma_numbers(text)
     try:
-        f = float(text)
+        # values are shown with thousand separators (1,234,567.89); Excel
+        # formulas can't contain those, so strip them before parsing
+        f = float(text.replace(",", "").replace(" ", ""))
         return int(f) if f.is_integer() else f
     except ValueError:
         return text
@@ -392,6 +394,7 @@ def process():
             if not os.path.isfile(ACPLACT_PATH):
                 raise FileNotFoundError("No existing acplact.xlsx found in the project folder.")
             acplact_wb = openpyxl.load_workbook(ACPLACT_PATH)
+            t2.repair_comma_formulas(acplact_wb)
             run_fn = t2.apply_new_month if mode_key == "new_month" else t2.replace_latest_month
             report = run_fn(acplact_wb, uploaded_ws)
             acplact_wb.save(PENDING_ACPLACT_PATH)
@@ -544,6 +547,7 @@ def confirm():
                         "value": value, "insert_before": section["item_end"] + 1,
                     })
         new_rows = t2.insert_new_sch_rows(sch_ws, new_field_assignments)
+        t2.repair_comma_formulas(acplact_wb)   # last line of defence before saving
 
         new_month = t2.get_current_month(acplact_wb).isoformat()
         backup_path = os.path.join(HISTORY_DIR, f"acplact_before_{mode_key}_{ts}.xlsx")
