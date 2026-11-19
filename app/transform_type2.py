@@ -32,7 +32,6 @@ from sheet1_formulas import compose
 import datetime
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.cell.cell import MergedCell
-from transform_type1 import remap_formula_rows
 
 FIFO_SCH_SHEET = "FIFO-sch"
 FIFO_PNL_SHEET = "FIFO - P & L"
@@ -282,6 +281,23 @@ def merge_code_into_row(ws, row, code, value, amount_col):
         amt_cell.value = f"=({base})+({add_text})"
 
 
+def remap_sch_row_refs(formula, remap, end_extra, in_sch):
+    """Shift row numbers of references that point at FIFO-sch only: unprefixed
+    refs when the formula itself sits in FIFO-sch, plus any 'FIFO-sch'!ref
+    from anywhere. References to other sheets (e.g. FIFO-sch's own
+    "'FIFO - P & L'!F8") are left alone — those sheets didn't gain rows."""
+    def _sub(m):
+        prefix, d1, c1, d2, r1, d3, c2, d4, r2 = m.groups()
+        target_is_sch = (prefix[:-1].strip("'") == FIFO_SCH_SHEET) if prefix else in_sch
+        if not target_is_sch:
+            return m.group(0)
+        out = f"{prefix or ''}{d1}{c1}{d2}{remap(int(r1))}"
+        if c2:
+            out += f":{d3}{c2}{d4}{remap(int(r2)) + end_extra(int(r2))}"
+        return out
+    return SHEET_REF_RE.sub(_sub, formula)
+
+
 def insert_new_sch_rows(ws, assignments):
     """assignments: [{"code", "desc", "value", "insert_before"}], where
     insert_before is a section's subtotal_row (from find_sections) — the
@@ -291,6 +307,7 @@ def insert_new_sch_rows(ws, assignments):
     brand-new row (there's nothing to carry forward)."""
     if not assignments:
         return []
+    amount_col = _current_amount_col(ws, SCH_HEADER_ROW, SCH_ANCHOR_COL)
     before_rows = sorted(a["insert_before"] for a in assignments)
 
     def remap(orig_row):
@@ -307,8 +324,21 @@ def insert_new_sch_rows(ws, assignments):
             cell = ws.cell(row=r, column=c)
             val = cell.value
             if isinstance(val, str) and val.startswith('='):
-                val = remap_formula_rows(val, remap, end_extra)
+                val = remap_sch_row_refs(val, remap, end_extra, in_sch=True)
             snapshot[(r, c)] = (val, copy.copy(cell._style))
+
+    # Other sheets (the P&L's "='FIFO-sch'!G94" section links) point INTO
+    # FIFO-sch by row number too — shift those as well, or every P&L line
+    # below an inserted row silently reads the wrong FIFO-sch row.
+    if ws.parent is not None:
+        for other in ws.parent.worksheets:
+            if other is ws:
+                continue
+            for row in other.iter_rows():
+                for cell in row:
+                    v = cell.value
+                    if isinstance(v, str) and v.startswith('=') and FIFO_SCH_SHEET in v:
+                        cell.value = remap_sch_row_refs(v, remap, end_extra, in_sch=False)
 
     final_max_row = orig_max_row + len(assignments)
     for r in range(1, final_max_row + 1):
@@ -333,7 +363,15 @@ def insert_new_sch_rows(ws, assignments):
         style_row = slot - 1 if slot > 1 else slot + 1
         for c in range(1, max_col + 1):
             ws.cell(row=slot, column=c)._style = copy.copy(ws.cell(row=style_row, column=c)._style)
-        for col, val in ((SCH_GL_COL, a["code"]), (SCH_DESC_COL, a["desc"]), (SCH_ANCHOR_COL + 1, a["value"])):
+        cells = [(SCH_GL_COL, a["code"]), (SCH_DESC_COL, a["desc"]), (amount_col, a["value"])]
+        if amount_col != SCH_ANCHOR_COL:
+            # paired month: give the new row its "only <month>" movement
+            # formula like every other row, so the section's movement
+            # subtotal includes it and it carries forward next month
+            amt = get_column_letter(amount_col)
+            prev = get_column_letter(amount_col + 2)
+            cells.append((SCH_ANCHOR_COL, f"={amt}{slot}-{prev}{slot}"))
+        for col, val in cells:
             cell = ws.cell(row=slot, column=col)
             if not isinstance(cell, MergedCell):
                 cell.value = val
