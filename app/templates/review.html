@@ -128,6 +128,23 @@
             </table>
           </div>
         {% else %}
+          {% if s.problems %}
+          <div class="tag warn" style="margin-bottom:8px; background:#fde8e8; color:#9b1c1c; border-color:#f5b5b5;">
+            Problems found in the result — fix these before using the file:</div>
+          {% for p in s.problems %}<div class="list-line" style="color:#9b1c1c;">{{ p }}</div>{% endfor %}
+          {% endif %}
+
+          {% if s.report.duplicates_resolved %}
+          <div class="tag ok" style="margin-top:6px;">GL code was listed in more than one row — now counted once, in the row that matches its ledger description</div>
+          {% for code, keep, desc, removed in s.report.duplicates_resolved %}
+          <div class="list-line">{{ code }} kept in row {{ keep }} ({{ desc }}); removed from row{{ 's' if removed|length > 1 }} {{ removed|join(', ') }}</div>
+          {% endfor %}
+          {% endif %}
+
+          {% if s.report.previous_sheet1_found is defined and not s.report.previous_sheet1_found %}
+          <div class="list-line" style="margin:6px 0;">Last month's upload wasn't found on this machine, so rows adjusted by hand last month can't be flagged this time.</div>
+          {% endif %}
+
           <p class="hint">Most of this transformation's rows aren't individually editable — they're either matched live from Sheet1 or purely calculated. The rows below are the only ones with no Sheet1 source at all, so they're open for you to type in directly. A <span class="empty-marker">*</span> next to a description means the box shows a suggestion (or is blank) rather than a confirmed Sheet1 value — review it before saving.</p>
 
           {% if s.editable_rows %}
@@ -148,7 +165,8 @@
                   <td>{{ r.row }}</td>
                   <td>{{ 'FIFO-sch' if r.sheet == 'sch' else 'FIFO-PNL' }}</td>
                   <td>{{ r.code }}</td>
-                  <td class="desc">{{ r.desc }}{% if r.needs_attention %} <span class="empty-marker" title="Not confirmed from Sheet1 — review before saving">*</span>{% endif %}</td>
+                  <td class="desc">{{ r.desc }}{% if r.needs_attention %} <span class="empty-marker" title="Not confirmed from Sheet1 — review before saving">*</span>{% endif %}
+                    {% if r.note %}<div style="font-size:11.5px; color:#8a5a00; margin-top:3px;">{{ r.note }}</div>{% endif %}</td>
                   <td>
                     <input class="cell-input" type="text" name="cell_acplact_{{ r.sheet }}_{{ r.row }}"
                            value="{{ r.value }}" data-original="{{ r.value }}">
@@ -217,12 +235,12 @@
                       <option value="">Don't add this month</option>
                       <optgroup label="Add as its own new row under:">
                         {% for sec in s.sch_sections %}
-                        <option value="sec::{{ sec.name }}">{{ sec.name }}</option>
+                        <option value="sec::{{ sec.name }}"{% if c.default == 'sec::' ~ sec.name %} selected{% endif %}>{{ sec.name }}</option>
                         {% endfor %}
                       </optgroup>
                       <optgroup label="Fold into an existing row:">
                         {% for m in s.sch_merge_targets %}
-                        <option value="row::{{ m.row }}">Row {{ m.row }} — {{ m.desc }}</option>
+                        <option value="row::{{ m.row }}"{% if c.default == 'row::' ~ m.row %} selected{% endif %}>Row {{ m.row }} — {{ m.desc }}{% if not m.code %} (no GL code yet){% endif %}{% if c.default == 'row::' ~ m.row %} — suggested: same figure as last month{% endif %}</option>
                         {% endfor %}
                       </optgroup>
                     </select>

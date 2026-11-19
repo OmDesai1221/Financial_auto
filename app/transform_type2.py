@@ -155,7 +155,56 @@ def find_duplicate_codes(wb):
         for code in parse_gl_codes(pnl.cell(row=r, column=PNL_GL_COL).value):
             locations.setdefault(code, []).append(
                 (FIFO_PNL_SHEET, r, pnl.cell(row=r, column=PNL_DESC_COL).value))
-    return {code: locs for code, locs in locations.items() if len(locs) > 1}
+    # A code used twice inside 'FIFO - P & L' only is deliberate: e.g. the
+    # Perf. Incentive code sits in Directors Remuneration AND again in the
+    # "Less: Other Expenses" memo block below Net Profit, which is a separate
+    # reconciliation, not part of the profit. Only FIFO-sch duplicates (or
+    # FIFO-sch vs P&L) actually double-count.
+    return {code: locs for code, locs in locations.items()
+            if len(locs) > 1 and any(s == FIFO_SCH_SHEET for s, _r, _d in locs)}
+
+
+DESC_STOPWORDS = {"charges", "charge", "expenses", "expense", "exp", "other", "others",
+                  "and", "the", "of", "on", "to", "for", "a/c", "ac", "paid", "&"}
+
+
+def _desc_words(text):
+    words = re.findall(r"[a-z]+", str(text or "").lower())
+    return {w[:5] for w in words if w not in DESC_STOPWORDS and len(w) > 2}
+
+
+def resolve_sch_duplicates(ws, descriptions):
+    """A code listed in several FIFO-sch rows is summed into every one of
+    them. Keep it only in the row whose description best matches the
+    code's own Sheet1 description (e.g. X5003006 "STAMP DUTY CHARGES" ->
+    "Loan Processing & Stamping charges", not "Interest on Cash Credit
+    Facilities & Other"), and take it out of the other rows' GL-code cells.
+    Only acts on a clear single winner; anything ambiguous is left as is
+    and still reported by find_duplicate_codes.
+    Returns [(code, kept_row, kept_desc, [removed_rows])]."""
+    where = {}
+    for r in range(SCH_FIRST_DATA_ROW, ws.max_row + 1):
+        for code in parse_gl_codes(ws.cell(row=r, column=SCH_GL_COL).value):
+            where.setdefault(code, []).append(r)
+    resolved = []
+    for code, rows in where.items():
+        if len(rows) < 2:
+            continue
+        code_words = _desc_words(descriptions.get(code))
+        scores = {r: len(code_words & _desc_words(ws.cell(row=r, column=SCH_DESC_COL).value))
+                  for r in rows}
+        best = max(scores.values())
+        winners = [r for r, s in scores.items() if s == best]
+        if best == 0 or len(winners) != 1:
+            continue
+        keep = winners[0]
+        removed = [r for r in rows if r != keep]
+        for r in removed:
+            cell = ws.cell(row=r, column=SCH_GL_COL)
+            cell.value = ",".join(c for c in parse_gl_codes(cell.value) if c != code) or None
+        resolved.append((code, keep, " ".join(str(ws.cell(row=keep, column=SCH_DESC_COL).value).split()),
+                         removed))
+    return resolved
 
 
 # ------------------------------------------------------- new-field sections
@@ -211,13 +260,23 @@ def list_sch_rows(ws):
     code could be folded INTO (e.g. a new interest code added alongside
     "Interest on Cash Credit Facilities & Other", the same way several
     codes already sit together in that row), as an alternative to giving
-    it a standalone new row."""
+    it a standalone new row.
+    Also includes item rows that have no GL code yet but are filled by hand
+    (e.g. "Solid Waste Testing Charges"), so a code can be attached there."""
+    item_rows = set()
+    for s in find_sections(ws):
+        item_rows.update(range(s["item_start"], s["item_end"] + 1))
     out = []
     for r in range(SCH_FIRST_DATA_ROW, ws.max_row + 1):
         code = ws.cell(row=r, column=SCH_GL_COL).value
+        desc = " ".join(str(ws.cell(row=r, column=SCH_DESC_COL).value or "").split())
         if code:
-            desc = " ".join(str(ws.cell(row=r, column=SCH_DESC_COL).value or "").split())
             out.append({"row": r, "desc": desc, "code": code})
+        elif r in item_rows and desc and not _is_section_header(ws, r):
+            amt = ws.cell(row=r, column=SCH_ANCHOR_COL + 1).value
+            if isinstance(amt, str) and CELL_REF_RE.search(amt):
+                continue   # a subtotal / calculated line, not an item
+            out.append({"row": r, "desc": desc, "code": ""})
     return out
 
 
@@ -266,15 +325,22 @@ def merge_code_into_row(ws, row, code, value, amount_col):
     if isinstance(value, str) and value.startswith('='):
         add_text = fix_comma_numbers(value)[1:]
     elif isinstance(value, (int, float)):
-        add_text = repr(value)
+        add_text = repr(round(value, 6))   # 1169.8600000000001 -> 1169.86
     else:
         try:
-            add_text = repr(float(str(value).replace(",", "").strip()))
+            add_text = repr(round(float(str(value).replace(",", "").strip()), 6))
         except ValueError:
             raise ValueError(f"Can't add {value!r} to row {row}: not a number or formula")
     amt_cell = ws.cell(row=row, column=amount_col)
     old = amt_cell.value
-    if isinstance(old, str) and old.startswith('='):
+    if old in (None, "") or not existing_codes:
+        # empty cell, or a hand-filled line getting its FIRST GL code (e.g.
+        # Solid Waste into "Solid Waste Testing Charges"): from now on the
+        # ledger is this row's source, so its figure REPLACES the hand-typed
+        # one rather than being added on top of it
+        amt_cell.value = f"={add_text}" if isinstance(value, str) else (
+            value if isinstance(value, (int, float)) else float(add_text))
+    elif isinstance(old, str) and old.startswith('='):
         amt_cell.value = old + f"+({add_text})"
     else:
         base = old if old not in (None, "") else 0
@@ -381,11 +447,88 @@ def insert_new_sch_rows(ws, assignments):
 
 TOTAL_FORMULAS = {}    # code -> Sheet1 arithmetic formula; set per run
 GROSS_FORMULA = None
+PREV_TOTALS = None     # last month's Sheet1 {code: Total Balance}, if the app found it
 
 
 def set_sheet1_formulas(by_code, gross):
     global TOTAL_FORMULAS, GROSS_FORMULA
     TOTAL_FORMULAS, GROSS_FORMULA = (by_code or {}), gross
+
+
+def set_previous_totals(prev_totals):
+    global PREV_TOTALS
+    PREV_TOTALS = prev_totals or None
+
+
+# ------------------------------------------------- hand-adjusted detection
+
+import ast
+import operator
+
+_BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+        ast.Div: operator.truediv, ast.Pow: operator.pow}
+
+
+def eval_arithmetic(v):
+    """Value of a plain number or a pure-arithmetic formula such as
+    "=-(58548257+55703519-1694871)" or "=ROUND(50474394/12,0)*5".
+    None for anything referring to cells or using other functions."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if not isinstance(v, str) or not v.startswith("=") or CELL_REF_RE.search(v):
+        return None
+    expr = v[1:].replace("%", "/100")
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return float(n.value)
+        if isinstance(n, ast.BinOp) and type(n.op) in _BIN:
+            return _BIN[type(n.op)](ev(n.left), ev(n.right))
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
+            x = ev(n.operand)
+            return -x if isinstance(n.op, ast.USub) else x
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id.upper() == "ROUND" and len(n.args) == 2):
+            return float(round(ev(n.args[0]), int(ev(n.args[1]))))
+        raise ValueError("unsupported")
+    try:
+        return ev(ast.parse(expr, mode="eval"))
+    except (ValueError, SyntaxError, ZeroDivisionError, TypeError):
+        return None
+
+
+def find_hand_adjusted(ws, amount_col_prev, prev_totals):
+    """Rows whose LAST month figure in the workbook differs from what last
+    month's Sheet1 said for its GL code(s) — i.e. the client changed the
+    ledger figure by hand (a reclass, a FIFO-costed stock value, part of an
+    expense moved to the memo block, ...). The tool can only fill this
+    month's raw ledger figure, so these are shown for review together with
+    last month's formula. Returns [(row, codes, desc, last_month_value,
+    last_month_ledger, last_month_formula)]."""
+    out = []
+    if not prev_totals:
+        return out
+    for r in range(SCH_FIRST_DATA_ROW, ws.max_row + 1):
+        codes = parse_gl_codes(ws.cell(row=r, column=SCH_GL_COL).value)
+        if not codes or all(c.startswith("X1") for c in codes):
+            continue   # opening stock is deliberately carried, never from Sheet1
+        ledger, _any_missing, all_missing = sum_for_codes(codes, prev_totals)
+        if all_missing:
+            continue
+        old = ws.cell(row=r, column=amount_col_prev).value
+        used = eval_arithmetic(old)
+        if used is None:
+            continue
+        if abs(used - ledger) <= 1 or abs(used + ledger) <= 1:   # closing stock is kept negative
+            continue
+        if used < 0 < ledger and all(c.startswith("R3") for c in codes):
+            ledger = -ledger   # show it with the sheet's own (deduction) sign
+        out.append((r, ws.cell(row=r, column=SCH_GL_COL).value,
+                    " ".join(str(ws.cell(row=r, column=SCH_DESC_COL).value or "").split()),
+                    used, ledger, old))
+    return out
 
 
 def _formula_or_value(codes, totals, value, negate=False):
@@ -713,9 +856,19 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
                 if kind == "adjustment_dropped":
                     manual_rows.append((r, desc, "adjustment_dropped"))
             elif kind == "value" and old_mvt is not None:
-                ws.cell(row=r, column=movement_col).value = old_mvt
+                if ws.cell(row=r, column=amount_col).value is not None:
+                    # a typed "only" figure (e.g. 0) next to a real as-on
+                    # amount: copying it would repeat last month's number,
+                    # so derive it like every other row instead
+                    amt, prev = get_column_letter(amount_col), get_column_letter(amount_col + 2)
+                    ws.cell(row=r, column=movement_col).value = f"={amt}{r}-{prev}{r}"
+                else:
+                    ws.cell(row=r, column=movement_col).value = old_mvt
+
+    hand_adjusted = find_hand_adjusted(ws, old_amount_col, PREV_TOTALS)
 
     return {
+        "hand_adjusted": hand_adjusted,
         "gl_rows_partial": gl_rows_partial,
         "gl_rows_manual": gl_rows_manual,
         "manual_rows": manual_rows,
@@ -825,17 +978,27 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
     # existing "=F6-F8" style formula already just works once 6 and 8 are
     # right, and gets carried forward by the generic logic below like any
     # other self-referential formula.
+    # Wadi sales: the client adds the Wadi figure (typed into its own row
+    # each month) into both Gross Sales and Net Sales. Keep doing that, as
+    # a live reference to the Wadi row instead of a re-typed number.
+    wadi_row, wadi_in_gross, wadi_in_net = find_wadi(ws, captured)
+    wadi_term = f"+ROUND({get_column_letter(amount_col)}{wadi_row},0)" if wadi_row else ""
+
     gross_sales_status = "missing"
     if gross_sales is not None:
-        ws.cell(row=PNL_GROSS_SALES_ROW, column=amount_col).value = GROSS_FORMULA or gross_sales
+        base = GROSS_FORMULA or gross_sales
+        if wadi_in_gross:
+            base = (base if isinstance(base, str) else f"={base}") + wadi_term
+        ws.cell(row=PNL_GROSS_SALES_ROW, column=amount_col).value = base
         gross_sales_status = "provided"
     else:
         ws.cell(row=PNL_GROSS_SALES_ROW, column=amount_col).value = None
 
     sch_amount_letter = get_column_letter(sch_amount_col)
     ws.cell(row=PNL_NET_SALES_ROW, column=amount_col).value = \
-        f"=+'{FIFO_SCH_SHEET}'!{sch_amount_letter}{SCH_NET_SALES_ROW}"
+        f"=+'{FIFO_SCH_SHEET}'!{sch_amount_letter}{SCH_NET_SALES_ROW}" + (wadi_term if wadi_in_net else "")
 
+    pnl_left_blank = []
     gl_rows = []
     for r in range(PNL_FIRST_DATA_ROW, max_row + 1):
         if r in (PNL_GROSS_SALES_ROW, PNL_NET_SALES_ROW):
@@ -857,17 +1020,30 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
             if not codes:
                 old_amount_off = 1 if 1 in captured[r] else 0
                 old_amount = captured[r][old_amount_off]["value"]
-                kind, new_value, _suggestion = classify_amount_formula(old_amount, prev_month, new_month)
+                kind, new_value, suggestion = classify_amount_formula(old_amount, prev_month, new_month)
                 if kind in ("template", "fiscal-accrual"):
                     ws.cell(row=r, column=amount_col).value = _retarget_column(
                         new_value, PNL_ANCHOR_COL + old_amount_off, amount_col)
                 else:
                     ws.cell(row=r, column=amount_col).value = None
+                    if old_amount is not None and desc:
+                        # had a figure last month (e.g. Wadi sales, the
+                        # foreign-travel memo line): needs this month's
+                        # figure typed in on the review page
+                        pnl_left_blank.append((r, " ".join(str(desc).split()), suggestion,
+                                               r == wadi_row))
 
         if movement_col is not None:
             old_mvt = captured[r].get(0, {}).get("value")
+            old_amt_prev = captured[r].get(1 if 1 in captured[r] else 0, {}).get("value")
             if isinstance(old_mvt, str) and old_mvt.startswith("="):
                 ws.cell(row=r, column=movement_col).value = old_mvt
+            elif isinstance(old_mvt, (int, float)) and old_amt_prev is not None and 1 in captured[r]:
+                # a typed "only" figure next to an as-on amount (e.g. Wadi):
+                # copying it would repeat last month's number — derive it
+                amt = get_column_letter(amount_col)
+                prev = get_column_letter(amount_col + 2)
+                ws.cell(row=r, column=movement_col).value = f"={amt}{r}-{prev}{r}"
             elif old_mvt is not None:
                 ws.cell(row=r, column=movement_col).value = old_mvt
 
@@ -875,7 +1051,43 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
         process_pnl_ratio_block(ws, new_month, is_new_year_start, amount_col, movement_col,
                                  max_row, new_ratio_front)
 
-    return {"gl_rows": gl_rows, "gross_sales_status": gross_sales_status}
+    return {"gl_rows": gl_rows, "gross_sales_status": gross_sales_status,
+            "pnl_left_blank": pnl_left_blank, "wadi_row": wadi_row,
+            "wadi_in_gross": wadi_in_gross, "wadi_in_net": wadi_in_net}
+
+
+WADI_TAIL_RE = re.compile(r"\+ROUND\(\$?[A-Z]{1,3}\$?\d+,0\)$")
+
+
+def find_wadi(ws, captured):
+    """(wadi_row, in_gross, in_net). The Wadi row is the P&L line labelled
+    'wadi'; it counts as included in Gross/Net Sales if last month's
+    formula there either references that row, or ends with "+<number>"
+    equal to last month's Wadi figure (rounded) — the hand-typed form."""
+    def old_amount(r):
+        cap = captured.get(r, {})
+        return cap.get(1 if 1 in cap else 0, {}).get("value")
+
+    for r in range(PNL_FIRST_DATA_ROW, ws.max_row + 1):
+        if "wadi" not in str(ws.cell(row=r, column=PNL_DESC_COL).value or "").lower():
+            continue
+        wadi_val = eval_arithmetic(old_amount(r))
+        ref_re = re.compile(rf"(?<![A-Z!$])\$?[A-Z]{{1,3}}\$?{r}(?!\d)")
+
+        def includes(formula):
+            if not isinstance(formula, str):
+                return False
+            own_sheet_only = re.sub(r"(?:'[^']*'|[A-Za-z_]\w*)!\$?[A-Z]+\$?\d+", "", formula)
+            if ref_re.search(own_sheet_only):   # e.g. "+ROUND(F43,0)"
+                return True
+            m = re.search(r"\+\s*(\d+(?:\.\d+)?)\s*$", formula)
+            return bool(m and wadi_val is not None and abs(float(m.group(1)) - round(wadi_val)) <= 1)
+
+        in_gross = includes(old_amount(PNL_GROSS_SALES_ROW))
+        in_net = includes(old_amount(PNL_NET_SALES_ROW))
+        if in_gross or in_net:
+            return r, in_gross, in_net
+    return None, False, False
 
 
 def process_pnl_ratio_block(ws, new_month, is_new_year_start, main_amount_col, main_movement_col,
@@ -950,6 +1162,7 @@ def apply_new_month(wb, sheet1_ws):
     sch_ws = wb[FIFO_SCH_SHEET]
     pnl_ws = wb[FIFO_PNL_SHEET]
 
+    duplicates_resolved = resolve_sch_duplicates(sch_ws, read_sheet1_descriptions(sheet1_ws))
     sch_report = process_fifo_sch(sch_ws, totals, new_month, is_new_year_start)
     pnl_report = process_fifo_pnl(pnl_ws, totals, new_month, is_new_year_start,
                                    gross_sales, sch_report["amount_col"])
@@ -965,6 +1178,11 @@ def apply_new_month(wb, sheet1_ws):
         "sign_flipped": sch_report["sign_flipped"],
         "opening_carried": sch_report["opening_carried"],
         "unmapped_codes": unmapped,
+        "hand_adjusted": sch_report["hand_adjusted"],
+        "pnl_left_blank": pnl_report["pnl_left_blank"],
+        "wadi_row": pnl_report["wadi_row"],
+        "duplicates_resolved": duplicates_resolved,
+        "previous_sheet1_found": PREV_TOTALS is not None,
     }
 
 
@@ -1011,6 +1229,7 @@ def replace_latest_month(wb, sheet1_ws):
 
     sch_amount_col = _current_amount_col(sch_ws, SCH_HEADER_ROW, SCH_ANCHOR_COL)
     pnl_amount_col = _current_amount_col(pnl_ws, PNL_HEADER_ROW, PNL_ANCHOR_COL)
+    duplicates_resolved = resolve_sch_duplicates(sch_ws, read_sheet1_descriptions(sheet1_ws))
 
     gl_rows_partial = []
     gl_rows_updated = []
@@ -1056,13 +1275,23 @@ def replace_latest_month(wb, sheet1_ws):
         pnl_gl_rows_updated.append((r, pnl_ws.cell(row=r, column=PNL_GL_COL).value,
                                      pnl_ws.cell(row=r, column=PNL_DESC_COL).value))
 
+    # keep a Wadi term ("+ROUND(F43,0)") already on Gross/Net Sales
+    def wadi_tail(v):
+        m = WADI_TAIL_RE.search(v) if isinstance(v, str) else None
+        return m.group(0) if m else ""
+
+    gross_cell = pnl_ws.cell(row=PNL_GROSS_SALES_ROW, column=pnl_amount_col)
+    net_cell = pnl_ws.cell(row=PNL_NET_SALES_ROW, column=pnl_amount_col)
+    gross_tail, net_tail = wadi_tail(gross_cell.value), wadi_tail(net_cell.value)
     gross_sales_status = "missing"
     if gross_sales is not None:
-        pnl_ws.cell(row=PNL_GROSS_SALES_ROW, column=pnl_amount_col).value = GROSS_FORMULA or gross_sales
+        base = GROSS_FORMULA or gross_sales
+        if gross_tail:
+            base = (base if isinstance(base, str) else f"={base}") + gross_tail
+        gross_cell.value = base
         gross_sales_status = "provided"
     sch_amount_letter = get_column_letter(sch_amount_col)
-    pnl_ws.cell(row=PNL_NET_SALES_ROW, column=pnl_amount_col).value = \
-        f"=+'{FIFO_SCH_SHEET}'!{sch_amount_letter}{SCH_NET_SALES_ROW}"
+    net_cell.value = f"=+'{FIFO_SCH_SHEET}'!{sch_amount_letter}{SCH_NET_SALES_ROW}" + net_tail
 
     return {
         "new_month": new_month.isoformat(),
@@ -1073,4 +1302,72 @@ def replace_latest_month(wb, sheet1_ws):
         "gl_rows_updated": gl_rows_updated,
         "gross_sales_status": gross_sales_status,
         "suggestions": {},
+        "duplicates_resolved": duplicates_resolved,
     }
+
+
+# ------------------------------------------------------------- validation
+
+def validate_workbook(wb):
+    """Last check before a workbook is shown or saved — everything that
+    has gone wrong before. Returns a list of plain-English problems (empty
+    when all is well):
+      - a formula Excel can't parse (Excel deletes those on open: the
+        "We found a problem with some content" prompt);
+      - a number with thousand separators inside a formula;
+      - a P&L line linking to an EMPTY FIFO-sch cell in the newest month
+        (the "Interest / Admin show -" problem after rows were inserted);
+      - a GL code still counted in two FIFO-sch rows;
+      - a new #REF! in the newest month."""
+    from openpyxl.formula.tokenizer import Tokenizer
+    problems = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if not (isinstance(v, str) and v.startswith("=")):
+                    continue
+                where = f"{ws.title}!{cell.coordinate}"
+                try:
+                    Tokenizer(v)
+                except Exception:
+                    problems.append(f"{where}: formula Excel can't read: {v[:80]}")
+                    continue
+                if COMMA_NUMBER_RE.search(v):
+                    problems.append(f"{where}: number with commas inside a formula: {v[:80]}")
+                if re.search(r"(?<![A-Za-z_])(None|nan)(?![A-Za-z_(])", v):
+                    problems.append(f"{where}: formula contains '{'None' if 'None' in v else 'nan'}': {v[:80]}")
+
+    sch = wb[FIFO_SCH_SHEET]
+    pnl = wb[FIFO_PNL_SHEET]
+    pnl_amt = _current_amount_col(pnl, PNL_HEADER_ROW, PNL_ANCHOR_COL)
+    sch_amt = _current_amount_col(sch, SCH_HEADER_ROW, SCH_ANCHOR_COL)
+    link_re = re.compile(rf"'{re.escape(FIFO_SCH_SHEET)}'!\$?([A-Z]{{1,3}})\$?(\d+)")
+    for col in range(PNL_ANCHOR_COL, pnl_amt + 1):
+        for r in range(1, pnl.max_row + 1):
+            v = pnl.cell(row=r, column=col).value
+            if isinstance(v, str):
+                for m in link_re.finditer(v):
+                    target = sch[f"{m.group(1)}{m.group(2)}"].value
+                    label = " ".join(str(pnl.cell(row=r, column=PNL_DESC_COL).value or "").split())
+                    if target in (None, ""):
+                        problems.append(f"P&L row {r} ({label}) links to FIFO-sch {m.group(1)}{m.group(2)}, "
+                                        f"which is empty — the line would show '-'")
+                    elif not (isinstance(target, str) and target.startswith("=")):
+                        # every P&L link points at a FIFO-sch TOTAL (a formula);
+                        # landing on a single typed figure means the link is
+                        # off by some rows (e.g. Cost of Sales reading closing stock)
+                        problems.append(f"P&L row {r} ({label}) links to FIFO-sch {m.group(1)}{m.group(2)}, "
+                                        f"a single figure ({target}) rather than a total — link is probably "
+                                        f"pointing at the wrong row")
+    for ws, last in ((pnl, pnl_amt), (sch, sch_amt)):
+        first = PNL_ANCHOR_COL if ws is pnl else SCH_ANCHOR_COL
+        for col in range(first, last + 1):
+            for r in range(1, ws.max_row + 1):
+                v = ws.cell(row=r, column=col).value
+                if isinstance(v, str) and "#REF!" in v:
+                    problems.append(f"{ws.title}!{get_column_letter(col)}{r}: #REF! in the newest month")
+    for code, locs in find_duplicate_codes(wb).items():
+        rows = ", ".join(f"{s} row {r}" for s, r, _d in locs)
+        problems.append(f"GL code {code} is counted in more than one row ({rows})")
+    return problems

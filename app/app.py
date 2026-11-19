@@ -157,6 +157,40 @@ def parse_edited_value(text):
         return text
 
 
+def find_previous_sheet1_totals(prev_month, exclude_path=None):
+    """Last month's Sheet1 {code: Total Balance}, from the newest earlier
+    upload whose title is for prev_month (every upload is kept in
+    UPLOAD_DIR). Used to spot rows the client adjusted by hand last month.
+    None if no such upload exists (e.g. first run on a new machine)."""
+    want = (prev_month.year, prev_month.month)
+    try:
+        names = sorted((f for f in os.listdir(UPLOAD_DIR) if f.endswith(".xlsx")), reverse=True)
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(UPLOAD_DIR, name)
+        if exclude_path and os.path.abspath(path) == os.path.abspath(exclude_path):
+            continue
+        try:
+            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+            ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb.worksheets[0]
+            title = next((v for row in ws.iter_rows(min_row=4, max_row=4, max_col=3, values_only=True)
+                          for v in row if v), "")
+            m = re.search(r'as on\s+([A-Za-z]+)[-\s]+(\d{4})', str(title))
+            if not m:
+                continue
+            month = datetime.datetime.strptime(m.group(1)[:3], "%b").month
+            if (int(m.group(2)), month) != want:
+                continue
+            wb.close()
+            wb = openpyxl.load_workbook(path, data_only=True)
+            ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb.worksheets[0]
+            return t2.read_sheet1_totals(ws)[0]
+        except Exception:
+            continue
+    return None
+
+
 def copy_sheet_values(src_ws, dest_ws):
     """Copy values (not formulas' side-effects) from an uploaded sheet into
     the persisted workbook's Sheet1, skipping merged-cell followers."""
@@ -251,6 +285,34 @@ def build_acplact_editable_rows(wb, report):
             "desc": sch_ws.cell(row=r, column=t2.SCH_DESC_COL).value or "",
             "value": display_value,
             "needs_attention": True,
+        })
+
+    # rows the client changed by hand LAST month (figure differs from last
+    # month's Sheet1): this month got the raw ledger figure — show last
+    # month's formula so the same kind of adjustment can be re-applied
+    for r, code, desc, used, ledger, old_formula in report.get("hand_adjusted", []):
+        if r in editable_sch_rows:
+            continue
+        cell = sch_ws.cell(row=r, column=sch_amount_col)
+        rows.append({
+            "sheet": "sch", "row": r, "code": code or "", "desc": desc,
+            "value": cell_display_value(cell.value),
+            "needs_attention": True,
+            "note": (f"Adjusted by hand last month: ledger said {ledger:,.2f}, the sheet used "
+                     f"{used:,.2f} ({old_formula}). This month has the raw ledger figure — "
+                     f"apply the same kind of adjustment if it still holds."),
+        })
+
+    # P&L lines that had a figure last month but have no source this month
+    # (Wadi sales, the foreign-travel memo line, ...)
+    for r, desc, suggestion, is_wadi in report.get("pnl_left_blank", []):
+        rows.append({
+            "sheet": "pnl", "row": r, "code": "", "desc": desc,
+            "value": "",
+            "needs_attention": True,
+            "note": ((f"Wadi sales as on this month — Gross Sales and Net Sales add it automatically. "
+                      if is_wadi else "Had a figure last month; enter this month's. ")
+                     + (f"Last month: {suggestion}" if suggestion else "")),
         })
 
     gross_cell = pnl_ws.cell(row=t2.PNL_GROSS_SALES_ROW, column=pnl_amount_col)
@@ -395,20 +457,38 @@ def process():
                 raise FileNotFoundError("No existing acplact.xlsx found in the project folder.")
             acplact_wb = openpyxl.load_workbook(ACPLACT_PATH)
             t2.repair_comma_formulas(acplact_wb)
+            prev_totals = None
+            if mode_key == "new_month":
+                _t, upload_month, _g = t2.read_sheet1_totals(uploaded_ws)
+                prev_totals = find_previous_sheet1_totals(t2._prev_month(upload_month), upload_path)
+            t2.set_previous_totals(prev_totals)
             run_fn = t2.apply_new_month if mode_key == "new_month" else t2.replace_latest_month
             report = run_fn(acplact_wb, uploaded_ws)
             acplact_wb.save(PENDING_ACPLACT_PATH)
 
-            sch_sections = t2.find_sections(acplact_wb[t2.FIFO_SCH_SHEET])
-            sch_merge_targets = t2.list_sch_rows(acplact_wb[t2.FIFO_SCH_SHEET])
+            sch_ws_now = acplact_wb[t2.FIFO_SCH_SHEET]
+            sch_sections = t2.find_sections(sch_ws_now)
+            sch_merge_targets = t2.list_sch_rows(sch_ws_now)
+            prev_amt_col = t2._current_amount_col(sch_ws_now, t2.SCH_HEADER_ROW, t2.SCH_ANCHOR_COL) + 2
             new_field_candidates = []
             for code, desc, amt in report.get("unmapped_codes", []):
                 formula = t2.TOTAL_FORMULAS.get(code)
-                value_text = formula if formula else (
-                    f"{amt:,.2f}" if isinstance(amt, float) else str(amt))
+                value_text = formula if formula else str(amt)
+                # if last month this code's ledger figure was typed by hand
+                # into some row (e.g. Solid Waste into "Solid Waste Testing
+                # Charges"), suggest folding it into that same row
+                default = ""
+                last = (prev_totals or {}).get(code)
+                if isinstance(last, (int, float)) and last:
+                    for m in sch_merge_targets:
+                        used = t2.eval_arithmetic(sch_ws_now.cell(row=m["row"], column=prev_amt_col).value)
+                        if used is not None and abs(used - last) <= 1:
+                            default = f"row::{m['row']}"
+                            break
                 new_field_candidates.append({"code": code, "desc": (desc or "").strip(),
-                                             "value": value_text})
+                                             "value": value_text, "default": default})
             dup_conflicts = t2.find_duplicate_codes(acplact_wb)
+            problems = t2.validate_workbook(acplact_wb)
 
             sections.append({
                 "key": "acplact",
@@ -421,6 +501,7 @@ def process():
                 "sch_merge_targets": sch_merge_targets,
                 "new_field_candidates": new_field_candidates,
                 "dup_conflicts": dup_conflicts,
+                "problems": problems,
             })
 
         return render_template("review.html", sections=sections, mode_key=mode_key,
@@ -548,6 +629,7 @@ def confirm():
                     })
         new_rows = t2.insert_new_sch_rows(sch_ws, new_field_assignments)
         t2.repair_comma_formulas(acplact_wb)   # last line of defence before saving
+        acplact_problems = t2.validate_workbook(acplact_wb)
 
         new_month = t2.get_current_month(acplact_wb).isoformat()
         backup_path = os.path.join(HISTORY_DIR, f"acplact_before_{mode_key}_{ts}.xlsx")
@@ -562,7 +644,8 @@ def confirm():
                     source_name, changes)
         downloads.append({"label": "ACPLACT", "filename": output_name, "edited": acplact_edited,
                           "changes": changes[:50], "changed_count": len(changes),
-                          "new_fields_added": new_rows, "fields_merged": merged_fields})
+                          "new_fields_added": new_rows, "fields_merged": merged_fields,
+                          "problems": acplact_problems})
         os.remove(PENDING_ACPLACT_PATH)
 
     return render_template("result.html", downloads=downloads, mode_label=MODES[mode_key]["label"])
