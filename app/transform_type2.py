@@ -1036,9 +1036,18 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
         if movement_col is not None:
             old_mvt = captured[r].get(0, {}).get("value")
             old_amt_prev = captured[r].get(1 if 1 in captured[r] else 0, {}).get("value")
-            if isinstance(old_mvt, str) and old_mvt.startswith("="):
+            typed_copy_of_amount = (
+                # e.g. Foreign Travelling memo: "only" =1143301-43200, the
+                # very same figure as its as-on — repeating it next month
+                # would be stale. (A fixed monthly formula like Directors'
+                # =600000*2+... differs from its as-on and is kept.)
+                isinstance(old_mvt, str) and old_mvt.startswith("=") and not CELL_REF_RE.search(old_mvt)
+                and eval_arithmetic(old_mvt) is not None and 1 in captured[r]
+                and eval_arithmetic(old_amt_prev) == eval_arithmetic(old_mvt))
+            if isinstance(old_mvt, str) and old_mvt.startswith("=") and not typed_copy_of_amount:
                 ws.cell(row=r, column=movement_col).value = old_mvt
-            elif isinstance(old_mvt, (int, float)) and old_amt_prev is not None and 1 in captured[r]:
+            elif (isinstance(old_mvt, (int, float)) or typed_copy_of_amount) \
+                    and old_amt_prev is not None and 1 in captured[r]:
                 # a typed "only" figure next to an as-on amount (e.g. Wadi):
                 # copying it would repeat last month's number — derive it
                 amt = get_column_letter(amount_col)
