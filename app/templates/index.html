@@ -229,6 +229,37 @@
       <div class="status-pill">ACPLACT: <strong>{{ acplact_month or "no data yet" }}</strong></div>
     </div>
 
+    {% set st = acplact_status %}
+    <div class="card" style="display:block; font-size:12.5px; line-height:1.55;
+         {% if st.errors or not st.exists %}border-color:#f3c0c0; background:#fdf3f3;{% endif %}">
+      <div style="font-weight:700; margin-bottom:4px;">
+        ACPLACT file in use:
+        {% if not st.exists %}<span style="color:#9b1c1c;">not found</span>
+        {% elif st.errors %}<span style="color:#9b1c1c;">DAMAGED — uploads are blocked until it is replaced</span>
+        {% else %}<span style="color:#245a3f;">&#10003; OK</span>{% endif %}
+      </div>
+      <div style="word-break:break-all;"><strong>{{ st.path }}</strong></div>
+      {% if st.exists %}<div>Latest month: <strong>{{ st.month or "unknown" }}</strong> · last saved {{ st.saved }}</div>{% endif %}
+      {% if st.lookalikes %}
+        <div style="margin-top:8px; color:#8a5a00;">
+          Other ACPLACT workbooks in these folders — <strong>NOT being used</strong>:
+          {% for f in st.lookalikes %}
+            <br>• {{ f.name }} ({{ f.month or "month unknown" }}, saved {{ f.when }}) in {{ f.folder }}
+            {% if f.double_ext %} — <strong>this is "acplact.xlsx.xlsx": Windows hid the extension when it was renamed</strong>{% endif %}
+          {% endfor %}
+          <br>To use one, it must be the file shown at the top: rename it to exactly <strong>acplact.xlsx</strong> in
+          {{ st.folder }} (in File Explorer turn on View → File name extensions to see the real name).
+        </div>
+      {% endif %}
+      {% if st.errors %}
+        <div style="color:#9b1c1c; margin-top:6px;">
+          {% for e in st.errors[:5] %}• {{ e }}<br>{% endfor %}
+          {% if st.errors|length > 5 %}• …and {{ st.errors|length - 5 }} more<br>{% endif %}
+          To fix: replace the file above with the correct workbook — same folder, named exactly <strong>acplact.xlsx</strong>.
+        </div>
+      {% endif %}
+    </div>
+
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, msg in messages %}
         <div class="flash {{ category }}">{{ msg }}</div>

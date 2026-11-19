@@ -53,17 +53,25 @@
         <p class="hint" style="{% if category == 'ok' %}color:#245a3f{% endif %}">{{ msg }}</p>
       {% endfor %}
     {% endwith %}
-    <div class="eyebrow">{{ mode_label }} — saved</div>
-    <h1>Update complete</h1>
+    {% set any_failed = downloads | selectattr('failed') | list | length > 0 %}
+    <div class="eyebrow">{{ mode_label }}{% if not any_failed %} — saved{% endif %}</div>
+    <h1>{% if any_failed %}Not everything was saved{% else %}Update complete{% endif %}</h1>
 
     {% for d in downloads %}
+    {% if d.failed %}
+    <div class="card" style="display:block; border-color:#f3c0c0; background:#fdf3f3;">
+      <div class="label" style="color:#9b1c1c;">{{ d.label }}: NOT saved — nothing was changed</div>
+      <div class="edited" style="color:#9b1c1c;">{% for p in d.problems %}• {{ p }}<br>{% endfor %}</div>
+      <div class="edited">The existing file is untouched. Fix the cause above, then upload again.</div>
+    </div>
+    {% else %}
     <div class="card">
       <div>
         <div class="label">{{ d.label }}</div>
         {% if d.edited %}<div class="edited">{{ d.edited }} manual edit(s) applied</div>{% endif %}
         {% if d.new_fields_added %}<div class="edited">{{ d.new_fields_added|length }} new field(s) added as their own row</div>{% endif %}
         {% if d.fields_merged %}<div class="edited">{{ d.fields_merged|length }} new field(s) added into an existing row</div>{% endif %}
-        {% if d.problems %}<div class="edited" style="color:#9b1c1c;">Problems found in the saved file — please check:{% for p in d.problems %}<br>• {{ p }}{% endfor %}</div>{% endif %}
+        {% if d.problems %}<div class="edited" style="color:#8a5a00;">Please check:{% for p in d.problems %}<br>• {{ p }}{% endfor %}</div>{% endif %}
       </div>
       <a class="button" href="/download/{{ d.filename }}">Download</a>
     </div>
@@ -77,6 +85,7 @@
     </div>
     {% else %}
     <p class="hint" style="color:#245a3f;">&#10003; {{ d.label }}: no figures of earlier months changed.</p>
+    {% endif %}
     {% endif %}
     {% endfor %}
 

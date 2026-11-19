@@ -157,6 +157,25 @@ def parse_edited_value(text):
         return text
 
 
+def bad_inputs(form, prefixes, current=None):
+    """Review-page boxes holding something that is neither blank, a number
+    (commas allowed) nor a formula — e.g. "abc" or "10 lakh". Written into
+    an amount cell, text turns every total that uses it into #VALUE!."""
+    bad = []
+    for key, text in form.items():
+        if not key.startswith(prefixes):
+            continue
+        if current is not None and current(key) == text.strip():
+            continue   # left as it was — only what the user changed is checked
+        v = parse_edited_value(text)
+        if isinstance(v, str) and not v.startswith("="):
+            bad.append(f"'{text.strip()}' typed in {key.replace('cell_acplact_', '').replace('cell_pnl_', 'row ').replace('nf_value_', 'new GL code #')}"
+                       f" is not a number or a formula (starting with =). Nothing was saved — go back and correct it.")
+        elif isinstance(v, str) and t2._stray_comma_positions(v):
+            bad.append(f"'{text.strip()}' typed in {key} has a comma Excel can't read. Nothing was saved.")
+    return bad
+
+
 def find_previous_sheet1_totals(prev_month, exclude_path=None):
     """Last month's Sheet1 {code: Total Balance}, from the newest earlier
     upload whose title is for prev_month (every upload is kept in
@@ -338,6 +357,81 @@ def get_pnl_current_month():
         return None
 
 
+class MasterDamagedError(Exception):
+    pass
+
+
+class UploadNotCalculatedError(Exception):
+    pass
+
+
+def file_fingerprint(path):
+    """mtime + size: enough to notice the master was swapped or changed
+    between the upload (review page) and Confirm."""
+    try:
+        st = os.stat(path)
+        return [st.st_mtime, st.st_size]
+    except OSError:
+        return None
+
+
+def acplact_master_status():
+    """What the tool will actually read as the ACPLACT master, shown on the
+    home page so nobody has to guess: full path, its latest month, when it
+    was last saved, whether it's healthy, and any OTHER ACPLACT workbook
+    lying in the project or app folder that's newer than it — the usual
+    sign a replacement was copied to the wrong place or got a double
+    extension (Windows hides ".xlsx", so "acplact.xlsx" typed as a new name
+    becomes "acplact.xlsx.xlsx")."""
+    st = {"path": ACPLACT_PATH, "folder": PROJECT_DIR, "exists": os.path.isfile(ACPLACT_PATH),
+          "month": None, "saved": None, "errors": [], "lookalikes": []}
+    if st["exists"]:
+        st["saved"] = datetime.datetime.fromtimestamp(
+            os.path.getmtime(ACPLACT_PATH)).strftime("%d %b %Y, %H:%M")
+        try:
+            wb = openpyxl.load_workbook(ACPLACT_PATH)
+            d = t2.get_current_month(wb)
+            st["month"] = d.strftime("%B %Y") if d else None
+            t2.repair_comma_formulas(wb)
+            st["errors"] = t2.blocking_problems(t2.validate_workbook(wb))
+        except Exception as e:
+            st["errors"] = [f"Could not read it: {e}"]
+    for folder in (PROJECT_DIR, BASE_DIR):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if (not name.lower().endswith(".xlsx") or name.startswith("~$")
+                    or os.path.abspath(path) == os.path.abspath(ACPLACT_PATH) or not os.path.isfile(path)):
+                continue
+            # every other ACPLACT workbook, whatever its date: a copied file
+            # keeps its ORIGINAL modified date on Windows, so "newer than the
+            # master" would hide exactly the replacement someone just dropped in
+            month = None
+            try:
+                wbo = openpyxl.load_workbook(path, read_only=True)
+                ok = t2.is_acplact_workbook(wbo.sheetnames)
+                if ok:
+                    try:
+                        d = t2.parse_sch_date(wbo[t2.FIFO_SCH_SHEET].cell(
+                            row=t2.SCH_DATE_ROW, column=t2.SCH_ANCHOR_COL).value)
+                        month = d.strftime("%B %Y")
+                    except Exception:
+                        pass
+                wbo.close()
+            except Exception:
+                ok = False
+            if ok:
+                st["lookalikes"].append({
+                    "name": name, "folder": folder, "month": month,
+                    "double_ext": name.lower().endswith(".xlsx.xlsx"),
+                    "when": datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%d %b %Y, %H:%M")})
+    st["lookalikes"].sort(key=lambda x: (not x["double_ext"], x["name"]))
+    return st
+
+
 def get_acplact_current_month():
     if not os.path.isfile(ACPLACT_PATH):
         return None
@@ -390,6 +484,7 @@ def index():
         modes=MODES,
         pnl_month=pnl_month,
         acplact_month=acplact_month,
+        acplact_status=acplact_master_status(),
         can_undo=can_undo,
         undo_lines=undo_preview() if can_undo else [],
         recent=recent_outputs(),
@@ -430,6 +525,20 @@ def process():
         formulas_wb = openpyxl.load_workbook(upload_path)
         formulas_ws = formulas_wb["Sheet1"] if "Sheet1" in formulas_wb.sheetnames \
             else formulas_wb.worksheets[0]
+        # A Sheet1 whose formula cells carry no saved result (exported by
+        # another program, or saved by a script rather than Excel) reads as
+        # EMPTY for every such cell: those codes would silently fall back to
+        # last month's figures. Refuse it instead.
+        uncached = [f"{formulas_ws.cell(row=r, column=12).coordinate}"
+                    for r in range(7, formulas_ws.max_row + 1)
+                    if isinstance(formulas_ws.cell(row=r, column=12).value, str)
+                    and formulas_ws.cell(row=r, column=12).value.startswith("=")
+                    and uploaded_ws.cell(row=r, column=12).value is None]
+        if uncached:
+            raise UploadNotCalculatedError(
+                f"Nothing was changed. {len(uncached)} formula cell(s) in the uploaded Sheet1's Amount "
+                f"column have no calculated value saved (e.g. {', '.join(uncached[:5])}) — the file was "
+                f"not last saved by Excel. Open it in Excel, press Save, and upload it again.")
         by_code, gross_formula = read_total_formulas(formulas_ws)
         t1.set_sheet1_formulas(by_code, gross_formula)
         t2.set_sheet1_formulas(by_code, gross_formula)
@@ -455,8 +564,28 @@ def process():
         if "acplact" in selected:
             if not os.path.isfile(ACPLACT_PATH):
                 raise FileNotFoundError("No existing acplact.xlsx found in the project folder.")
+            acplact_fp = file_fingerprint(ACPLACT_PATH)
             acplact_wb = openpyxl.load_workbook(ACPLACT_PATH)
             t2.repair_comma_formulas(acplact_wb)
+            # Refuse to build on a damaged master: every month made from it
+            # would inherit the broken links (this is exactly what happened
+            # when an old, damaged acplact.xlsx was still the one being read)
+            master_errors = t2.blocking_problems(t2.validate_workbook(acplact_wb))
+            if master_errors:
+                month = t2.get_current_month(acplact_wb)
+                raise MasterDamagedError(
+                    f"Nothing was changed. The ACPLACT file the tool is reading — {ACPLACT_PATH} "
+                    f"(latest month {month.strftime('%B %Y') if month else 'unknown'}, saved "
+                    f"{datetime.datetime.fromtimestamp(os.path.getmtime(ACPLACT_PATH)).strftime('%d %b %Y %H:%M')}) "
+                    f"— is damaged, so it is not the corrected file: "
+                    + "; ".join(master_errors[:4])
+                    + (f"; and {len(master_errors) - 4} more" if len(master_errors) > 4 else "")
+                    + ". Replace that exact file with the correct workbook (named exactly acplact.xlsx, "
+                      "in that folder) and upload again. The home page shows which file is in use.")
+            with open(META_PATH, "r+", encoding="utf-8") as f:
+                meta = json.load(f)
+                meta["acplact_fp"] = acplact_fp
+                f.seek(0); f.truncate(); json.dump(meta, f)
             prev_totals = None
             if mode_key == "new_month":
                 _t, upload_month, _g = t2.read_sheet1_totals(uploaded_ws)
@@ -509,7 +638,8 @@ def process():
                                 source_labels=SOURCE_LABELS)
 
     except (t1.NotANewMonthError, t1.NotTheLatestMonthError,
-            t2.NotANewMonthError, t2.NotTheLatestMonthError) as e:
+            t2.NotANewMonthError, t2.NotTheLatestMonthError, MasterDamagedError,
+            UploadNotCalculatedError) as e:
         for p in (PENDING_PNL_PATH, PENDING_ACPLACT_PATH):
             if os.path.isfile(p):
                 os.remove(p)
@@ -539,15 +669,23 @@ def confirm():
     downloads = []
     try:
         with open(META_PATH, encoding="utf-8") as f:
-            source_name = json.load(f).get("source", "")
+            meta = json.load(f)
     except (OSError, ValueError):
-        source_name = ""
+        meta = {}
+    source_name = meta.get("source", "")
 
     if ran_pnl:
         pnl_wb = openpyxl.load_workbook(PENDING_PNL_PATH)
         ws = pnl_wb["P&L"]
         t1.detect_layout(ws)
         edited = 0
+        pnl_bad = bad_inputs(request.form, ("cell_pnl_",), lambda k: cell_display_value(
+            ws.cell(row=int(k[len("cell_pnl_"):]), column=t1.TOTAL_COL).value))
+        if pnl_bad:
+            os.remove(PENDING_PNL_PATH)
+            ran_pnl = False
+            downloads.append({"label": "PNL", "failed": True, "problems": pnl_bad})
+    if ran_pnl:
         for key, text in request.form.items():
             if not key.startswith("cell_pnl_"):
                 continue
@@ -574,6 +712,33 @@ def confirm():
         downloads.append({"label": "PNL", "filename": output_name, "edited": edited,
                           "changes": changes[:50], "changed_count": len(changes)})
         os.remove(PENDING_PNL_PATH)
+
+    if ran_acplact and meta.get("acplact_fp") and file_fingerprint(ACPLACT_PATH) != meta.get("acplact_fp"):
+        # the master was replaced/changed AFTER this review page was built:
+        # the pending result is based on the OLD file — never save it
+        os.remove(PENDING_ACPLACT_PATH)
+        ran_acplact = False
+        downloads.append({"label": "ACPLACT", "failed": True, "problems": [
+            f"{ACPLACT_PATH} was changed after you uploaded (it was replaced or edited while the "
+            "review page was open), so this review was built from the OLD file. Nothing was "
+            "saved — please upload Sheet1 again so it is built from the current file."]})
+
+    if ran_acplact:
+        _pend = openpyxl.load_workbook(PENDING_ACPLACT_PATH)
+
+        def _current(k):
+            if not k.startswith("cell_acplact_"):
+                return None
+            sheet, row = k[len("cell_acplact_"):].split("_")
+            ws_ = _pend[t2.FIFO_SCH_SHEET if sheet == "sch" else t2.FIFO_PNL_SHEET]
+            col = t2._current_amount_col(ws_, t2.SCH_HEADER_ROW if sheet == "sch" else t2.PNL_HEADER_ROW,
+                                         t2.SCH_ANCHOR_COL if sheet == "sch" else t2.PNL_ANCHOR_COL)
+            return cell_display_value(ws_.cell(row=int(row), column=col).value)
+        acplact_bad = bad_inputs(request.form, ("cell_acplact_", "nf_value_"), _current)
+        if acplact_bad:
+            os.remove(PENDING_ACPLACT_PATH)
+            ran_acplact = False
+            downloads.append({"label": "ACPLACT", "failed": True, "problems": acplact_bad})
 
     if ran_acplact:
         acplact_wb = openpyxl.load_workbook(PENDING_ACPLACT_PATH)
@@ -630,7 +795,15 @@ def confirm():
         new_rows = t2.insert_new_sch_rows(sch_ws, new_field_assignments)
         t2.repair_comma_formulas(acplact_wb)   # last line of defence before saving
         acplact_problems = t2.validate_workbook(acplact_wb)
+        acplact_errors = t2.blocking_problems(acplact_problems)
 
+    if ran_acplact and acplact_errors:
+        # never let a broken result become the master or a download
+        os.remove(PENDING_ACPLACT_PATH)
+        ran_acplact = False
+        downloads.append({"label": "ACPLACT", "failed": True, "problems": acplact_errors})
+
+    if ran_acplact:
         new_month = t2.get_current_month(acplact_wb).isoformat()
         backup_path = os.path.join(HISTORY_DIR, f"acplact_before_{mode_key}_{ts}.xlsx")
         shutil.copy(ACPLACT_PATH, backup_path)

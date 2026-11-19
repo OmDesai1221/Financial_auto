@@ -288,10 +288,42 @@ def list_sch_rows(ws):
 COMMA_NUMBER_RE = re.compile(r'(?<![A-Za-z0-9_.])\((\s*-?\d{1,3}(?:,\d{2,3})+(?:\.\d+)?\s*)\)')
 
 
+def _stray_comma_positions(formula):
+    """Indexes of commas that are NOT separating a function's arguments
+    (e.g. "=1,234+5" or "=(1,234)"): Excel can't read those as numbers, so
+    the file opens with "We found a problem with some content" and the
+    formula is deleted. Text inside quotes ('FIFO - P & L'!, "x,y") is
+    skipped."""
+    stray, stack, quote = [], [], None
+    for i, ch in enumerate(formula):
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            j = i - 1
+            while j >= 0 and formula[j] == " ":
+                j -= 1
+            stack.append(j >= 0 and (formula[j].isalnum() or formula[j] in "._"))  # function call?
+        elif ch == ")":
+            if stack:
+                stack.pop()
+        elif ch == "," and not (stack and stack[-1]):
+            stray.append(i)
+    return stray
+
+
 def fix_comma_numbers(formula):
-    if not isinstance(formula, str) or not formula.startswith("="):
+    """Remove thousand separators from numbers in a formula
+    ("=(1,234,567.89)+1,000" -> "=(1234567.89)+1000"), leaving function
+    argument commas (ROUND(x,0)) alone."""
+    if not isinstance(formula, str) or not formula.startswith("=") or "," not in formula:
         return formula
-    return COMMA_NUMBER_RE.sub(lambda m: "(" + m.group(1).replace(",", "").strip() + ")", formula)
+    drop = {i for i in _stray_comma_positions(formula)
+            if 0 < i < len(formula) - 1 and formula[i - 1].isdigit() and formula[i + 1].isdigit()}
+    return "".join(ch for i, ch in enumerate(formula) if i not in drop)
 
 
 def repair_comma_formulas(wb):
@@ -588,6 +620,37 @@ def sum_for_codes(codes, totals):
     return total, any_missing, all_missing
 
 
+def retarget_month(formula, own_sheet, own_from, own_to, other_from, other_to):
+    """Move a formula from last month's amount column to this month's, in
+    BOTH sheets: references on its own sheet go own_from -> own_to, and
+    references into the other ACPLACT sheet go other_from -> other_to.
+    Normally both stay put (G->G, F->F), but around the fiscal-year start
+    they don't: April's single column sits one to the left (G->F), and May
+    moves back (F->G) — a P&L link like ='FIFO-sch'!G56 has to follow, or
+    April's Cost of Sales would read March's "only" column."""
+    own_f, own_t = get_column_letter(own_from), get_column_letter(own_to)
+    oth_f, oth_t = get_column_letter(other_from), get_column_letter(other_to)
+    other_sheet = FIFO_PNL_SHEET if own_sheet == FIFO_SCH_SHEET else FIFO_SCH_SHEET
+
+    def _sub(m):
+        prefix, d1, c1, d2, r1, d3, c2, d4, r2 = m.groups()
+        if prefix:
+            name = prefix[:-1].strip("'")
+            if name == other_sheet:
+                f, t = oth_f, oth_t
+            elif name == own_sheet:
+                f, t = own_f, own_t
+            else:
+                return m.group(0)
+        else:
+            f, t = own_f, own_t
+        out = f"{prefix or ''}{d1}{t if c1 == f else c1}{d2}{r1}"
+        if c2:
+            out += f":{d3}{t if c2 == f else c2}{d4}{r2}"
+        return out
+    return SHEET_REF_RE.sub(_sub, formula)
+
+
 def _retarget_column(formula, from_col, to_col):
     from_letter = get_column_letter(from_col)
     to_letter = get_column_letter(to_col)
@@ -669,7 +732,9 @@ def shift_columns_and_style(ws, anchor_col, insert_count, max_row, real_cols):
     captured = {}
     for r in range(1, max_row + 1):
         captured[r] = {}
-        for off in range(insert_count):
+        # always keep BOTH of last month's columns: after a single-column
+        # (April) month, last month's figure is at offset 0, otherwise at 1
+        for off in range(max(insert_count, 2)):
             cell = ws.cell(row=r, column=anchor_col + off)
             captured[r][off] = {"value": cell.value, "style": copy.copy(cell._style)}
 
@@ -764,8 +829,13 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
     max_row = ws.max_row
     insert_count = 1 if is_new_year_start else 2
 
+    # where LAST month's as-on figure is: next to its "only" column normally,
+    # or in the anchor column itself when last month was the single-column
+    # fiscal-year start (April)
+    prev_amount_off = _current_amount_col(ws, SCH_HEADER_ROW, SCH_ANCHOR_COL) - SCH_ANCHOR_COL
+    prev_was_single = prev_amount_off == 0
     captured = shift_columns_and_style(ws, SCH_ANCHOR_COL, insert_count, max_row, real_cols)
-    old_amount_col = SCH_ANCHOR_COL + 1 + insert_count   # where last month's amount now sits
+    old_amount_col = SCH_ANCHOR_COL + prev_amount_off + insert_count   # where it sits now
 
     amount_col = SCH_ANCHOR_COL if is_new_year_start else SCH_ANCHOR_COL + 1
     movement_col = None if is_new_year_start else SCH_ANCHOR_COL
@@ -785,11 +855,13 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
     prev_month = _prev_month(new_month)
 
     def apply_manual_amount(r, desc):
-        old_amount_off = 1 if 1 in captured[r] else 0
+        old_amount_off = prev_amount_off
         old_amount = captured[r][old_amount_off]["value"]
         kind, new_value, suggestion = classify_amount_formula(old_amount, prev_month, new_month)
         if kind in ("template", "fiscal-accrual"):
-            formula = _retarget_column(new_value, SCH_ANCHOR_COL + old_amount_off, amount_col)
+            pnl_now = PNL_ANCHOR_COL if is_new_year_start else PNL_ANCHOR_COL + 1
+            formula = retarget_month(new_value, FIFO_SCH_SHEET, SCH_ANCHOR_COL + old_amount_off, amount_col,
+                                     PNL_ANCHOR_COL + old_amount_off, pnl_now)
             ws.cell(row=r, column=amount_col).value = formula
             if desc:
                 manual_rows.append((r, desc, kind))
@@ -820,6 +892,18 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
             has_refs = isinstance(old_amt, str) and old_amt.startswith("=") and CELL_REF_RE.search(old_amt)
             if is_new_year_start or old_amt is None or has_refs:
                 apply_manual_amount(r, desc)
+                if is_new_year_start:
+                    # a new year's opening stock = last year's closing stock
+                    # (the stock row just below, e.g. Op Stock 34 <- Closing 36),
+                    # not last year's opening, which the review box would
+                    # otherwise be pre-filled with
+                    for cr in range(r + 1, min(r + 6, max_row + 1)):
+                        cc = parse_gl_codes(ws.cell(row=cr, column=SCH_GL_COL).value)
+                        if cc and all(c.startswith("R3") for c in cc):
+                            closing = eval_arithmetic(ws.cell(row=cr, column=old_amount_col).value)
+                            if closing is not None:
+                                suggestions[r] = repr(round(abs(closing), 2))
+                            break
             else:
                 ws.cell(row=r, column=amount_col).value = old_amt
                 opening_carried.append((r, code_cell, desc))
@@ -848,7 +932,12 @@ def process_fifo_sch(ws, totals, new_month, is_new_year_start):
         else:
             apply_manual_amount(r, desc)
 
-        if movement_col is not None:
+        if movement_col is not None and prev_was_single:
+            # the month after the fiscal-year start (May): last month has no
+            # "only" column to copy, so build it the way the client's May is
+            ws.cell(row=r, column=movement_col).value = derive_movement(
+                ws, r, amount_col, movement_col, FIFO_SCH_SHEET, codes)
+        elif movement_col is not None:
             old_mvt = captured[r].get(0, {}).get("value")
             kind, new_formula = classify_movement_formula(old_mvt, r)
             if kind in ("template", "adjustment_dropped"):
@@ -918,6 +1007,8 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
 
     # Step 1: shift the main block AND its one spacer column by insert_count.
     main_and_spacer_cols = list(real_cols) + ([last_main_col_before_shift + 1] if real_ratio_cols else [])
+    prev_amount_off = _current_amount_col(ws, PNL_HEADER_ROW, PNL_ANCHOR_COL) - PNL_ANCHOR_COL
+    prev_was_single = prev_amount_off == 0
     captured = shift_columns_and_style(ws, PNL_ANCHOR_COL, insert_count, max_row, main_and_spacer_cols)
 
     # Step 2: relocate the ratio block's OLD content by 2x insert_count
@@ -981,7 +1072,7 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
     # Wadi sales: the client adds the Wadi figure (typed into its own row
     # each month) into both Gross Sales and Net Sales. Keep doing that, as
     # a live reference to the Wadi row instead of a re-typed number.
-    wadi_row, wadi_in_gross, wadi_in_net = find_wadi(ws, captured)
+    wadi_row, wadi_in_gross, wadi_in_net = find_wadi(ws, captured, prev_amount_off)
     wadi_term = f"+ROUND({get_column_letter(amount_col)}{wadi_row},0)" if wadi_row else ""
 
     gross_sales_status = "missing"
@@ -1018,12 +1109,13 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
                     ws.cell(row=r, column=amount_col).value = _formula_or_value(codes, totals, value)
                     gl_rows.append((r, code_cell, desc))
             if not codes:
-                old_amount_off = 1 if 1 in captured[r] else 0
+                old_amount_off = prev_amount_off
                 old_amount = captured[r][old_amount_off]["value"]
                 kind, new_value, suggestion = classify_amount_formula(old_amount, prev_month, new_month)
                 if kind in ("template", "fiscal-accrual"):
-                    ws.cell(row=r, column=amount_col).value = _retarget_column(
-                        new_value, PNL_ANCHOR_COL + old_amount_off, amount_col)
+                    ws.cell(row=r, column=amount_col).value = retarget_month(
+                        new_value, FIFO_PNL_SHEET, PNL_ANCHOR_COL + old_amount_off, amount_col,
+                        SCH_ANCHOR_COL + old_amount_off, sch_amount_col)
                 else:
                     ws.cell(row=r, column=amount_col).value = None
                     if old_amount is not None and desc:
@@ -1033,21 +1125,25 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
                         pnl_left_blank.append((r, " ".join(str(desc).split()), suggestion,
                                                r == wadi_row))
 
-        if movement_col is not None:
+        if movement_col is not None and prev_was_single:
+            ws.cell(row=r, column=movement_col).value = derive_movement(
+                ws, r, amount_col, movement_col, FIFO_PNL_SHEET, codes,
+                copy_prev_constant=(not codes and r != wadi_row), running_total=(r == wadi_row))
+        elif movement_col is not None:
             old_mvt = captured[r].get(0, {}).get("value")
-            old_amt_prev = captured[r].get(1 if 1 in captured[r] else 0, {}).get("value")
+            old_amt_prev = captured[r].get(prev_amount_off, {}).get("value")
             typed_copy_of_amount = (
                 # e.g. Foreign Travelling memo: "only" =1143301-43200, the
                 # very same figure as its as-on — repeating it next month
                 # would be stale. (A fixed monthly formula like Directors'
                 # =600000*2+... differs from its as-on and is kept.)
                 isinstance(old_mvt, str) and old_mvt.startswith("=") and not CELL_REF_RE.search(old_mvt)
-                and eval_arithmetic(old_mvt) is not None and 1 in captured[r]
+                and eval_arithmetic(old_mvt) is not None
                 and eval_arithmetic(old_amt_prev) == eval_arithmetic(old_mvt))
             if isinstance(old_mvt, str) and old_mvt.startswith("=") and not typed_copy_of_amount:
                 ws.cell(row=r, column=movement_col).value = old_mvt
             elif (isinstance(old_mvt, (int, float)) or typed_copy_of_amount) \
-                    and old_amt_prev is not None and 1 in captured[r]:
+                    and old_amt_prev is not None:
                 # a typed "only" figure next to an as-on amount (e.g. Wadi):
                 # copying it would repeat last month's number — derive it
                 amt = get_column_letter(amount_col)
@@ -1068,14 +1164,74 @@ def process_fifo_pnl(ws, totals, new_month, is_new_year_start, gross_sales, sch_
 WADI_TAIL_RE = re.compile(r"\+ROUND\(\$?[A-Z]{1,3}\$?\d+,0\)$")
 
 
-def find_wadi(ws, captured):
+BIG_NUMBER_RE = re.compile(r"(?<![A-Z$\d.])\d{4,}")
+
+
+def derive_movement(ws, r, amount_col, movement_col, sheet, codes, other_cols=None, copy_prev_constant=False,
+                    running_total=False):
+    """The "only <month>" formula for a month whose PREVIOUS month is the
+    single-column fiscal-year start (i.e. May), mirroring how the client's
+    own May column is built:
+      - a total / calculated line (formula of references, e.g. =SUM(G17:G50),
+        =G54-G55, ='FIFO-sch'!G94): the same formula over the "only" columns;
+      - opening stock: minus last month's closing stock (=-H36);
+      - closing stock: this month's figure (=G36);
+      - a fixed monthly memo line (P&L rows like "Rafiqbhai a/c" =100000,
+        copy_prev_constant): last month's same fixed figure;
+      - anything else: this month's as-on minus last month's (=G7-H7)."""
+    if copy_prev_constant:
+        pv = ws.cell(row=r, column=amount_col + 1).value
+        cur = ws.cell(row=r, column=amount_col).value
+        # only a NON-cumulative line: this month's as-on is blank (the memo
+        # lines are left for the person to fill) or the same as last month's.
+        # A running total like Gross Sales grows, so it's never copied.
+        if pv is not None and eval_arithmetic(pv) is not None and (
+                cur is None or eval_arithmetic(cur) == eval_arithmetic(pv)):
+            return pv
+    v = ws.cell(row=r, column=amount_col).value
+    amt, prev = get_column_letter(amount_col), get_column_letter(amount_col + 1)
+    if running_total:
+        # e.g. Wadi sales: its as-on figure is typed on the review page AFTER
+        # this runs, so build the "only" formula even though it's blank now
+        return f"={amt}{r}-{prev}{r}"
+    if v is None:
+        return None
+    if isinstance(v, str) and v.startswith("=") and CELL_REF_RE.search(v) and not BIG_NUMBER_RE.search(v):
+        own_from, own_to = amount_col, movement_col
+        other = FIFO_PNL_SHEET if sheet == FIFO_SCH_SHEET else FIFO_SCH_SHEET
+        # the OTHER sheet's (as-on, only) columns for the same month; by
+        # default the newest ones, i.e. its anchor+1 and anchor
+        oa, om = other_cols or (SHEET_ANCHORS[other] + 1, SHEET_ANCHORS[other])
+        o_from, o_to = get_column_letter(oa), get_column_letter(om)
+        f_from, f_to = get_column_letter(own_from), get_column_letter(own_to)
+
+        def _sub(m):
+            prefix, d1, c1, d2, r1, d3, c2, d4, r2 = m.groups()
+            src, dst = (o_from, o_to) if (prefix and prefix[:-1].strip("'") == other) else (f_from, f_to)
+            out = f"{prefix or ''}{d1}{dst if c1 == src else c1}{d2}{r1}"
+            if c2:
+                out += f":{d3}{dst if c2 == src else c2}{d4}{r2}"
+            return out
+        return SHEET_REF_RE.sub(_sub, v)
+    if sheet == FIFO_SCH_SHEET and codes and all(c.startswith("X1") for c in codes):
+        for cr in range(r + 1, min(r + 6, ws.max_row + 1)):
+            cc = parse_gl_codes(ws.cell(row=cr, column=SCH_GL_COL).value)
+            if cc and all(c.startswith("R3") for c in cc):
+                closing = eval_arithmetic(ws.cell(row=cr, column=amount_col + 1).value)
+                return f"={'-' if closing is not None and closing < 0 else ''}{prev}{cr}"
+    if sheet == FIFO_SCH_SHEET and codes and all(c.startswith("R3") for c in codes):
+        return f"={amt}{r}"
+    return f"={amt}{r}-{prev}{r}"
+
+
+def find_wadi(ws, captured, prev_amount_off=1):
     """(wadi_row, in_gross, in_net). The Wadi row is the P&L line labelled
     'wadi'; it counts as included in Gross/Net Sales if last month's
     formula there either references that row, or ends with "+<number>"
     equal to last month's Wadi figure (rounded) — the hand-typed form."""
     def old_amount(r):
         cap = captured.get(r, {})
-        return cap.get(1 if 1 in cap else 0, {}).get("value")
+        return cap.get(prev_amount_off, {}).get("value")
 
     for r in range(PNL_FIRST_DATA_ROW, ws.max_row + 1):
         if "wadi" not in str(ws.cell(row=r, column=PNL_DESC_COL).value or "").lower():
@@ -1342,8 +1498,9 @@ def validate_workbook(wb):
                 except Exception:
                     problems.append(f"{where}: formula Excel can't read: {v[:80]}")
                     continue
-                if COMMA_NUMBER_RE.search(v):
-                    problems.append(f"{where}: number with commas inside a formula: {v[:80]}")
+                if _stray_comma_positions(v):
+                    problems.append(f"{where}: comma outside a function in a formula "
+                                    f"(Excel can't read it): {v[:80]}")
                 if re.search(r"(?<![A-Za-z_])(None|nan)(?![A-Za-z_(])", v):
                     problems.append(f"{where}: formula contains '{'None' if 'None' in v else 'nan'}': {v[:80]}")
 
@@ -1380,3 +1537,15 @@ def validate_workbook(wb):
         rows = ", ".join(f"{s} row {r}" for s, r, _d in locs)
         problems.append(f"GL code {code} is counted in more than one row ({rows})")
     return problems
+
+
+def blocking_problems(problems):
+    """The validate_workbook problems that must stop a save. A code listed
+    in two rows is only a warning (the tool resolves the clear cases itself
+    and reports the rest); everything else means the file would open with
+    errors or blank/wrong lines."""
+    return [p for p in problems if not p.startswith("GL code")]
+
+
+def is_acplact_workbook(wb_sheetnames):
+    return FIFO_SCH_SHEET in wb_sheetnames and FIFO_PNL_SHEET in wb_sheetnames
